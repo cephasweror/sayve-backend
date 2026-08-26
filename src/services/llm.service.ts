@@ -84,7 +84,11 @@ export class LLMService {
       text.includes('made this week') ||
       text.includes('made today') ||
       text.includes('income today') ||
-      text.includes('profit this')
+      text.includes('profit this') ||
+      text.includes('track my money') ||
+      text.includes('track money') ||
+      text.includes('track expenses') ||
+      text.includes('track sales')
     ) {
       let queryPeriod: 'today' | 'week' | 'month' = 'month';
       if (text.includes('week')) queryPeriod = 'week';
@@ -99,8 +103,18 @@ export class LLMService {
       });
     }
 
-    // Check if export request
-    if (text.includes('send my report') || text.includes('export') || text.includes('csv')) {
+    // Check if export request (handles typos like 'cvs', 'excel', 'report', 'download')
+    if (
+      text.includes('send my report') ||
+      text.includes('export') ||
+      text.includes('csv') ||
+      text.includes('cvs') ||
+      text.includes('report') ||
+      text.includes('excel') ||
+      text.includes('download') ||
+      text.includes('spreadsheet') ||
+      text.includes('file')
+    ) {
       return JSON.stringify({
         isTransaction: false,
         isCorrection: false,

@@ -46,8 +46,8 @@ Rules:
 1. If the user is logging a sale or money received -> type is "income". Default category is "Sales".
 2. If the user is logging spending, buying, or paying money -> type is "expense". Choose matching category.
 3. If the user says "no, it's Rent" or correcting a category -> isCorrection: true, correctedCategory: "Rent".
-4. If the user asks for financial reports ("how much did I make this week", "show expenses this month") -> isSummaryQuery: true.
-5. If the user asks to "send my report" or "export csv" -> isExportRequest: true.
+4. If the user asks for financial reports or money tracking ("how much did I make", "track my money for today", "show expenses") -> isSummaryQuery: true. Detect queryPeriod as "today", "week", or "month".
+5. If the user asks for a file, data export, or typos like "CVS", "CSV", "report", "excel", "spreadsheet", "download records" -> isExportRequest: true.
 6. Convert currency shorthand like "45k" or "45 thousand" to numbers (45000).
 `;
 
