@@ -1,7 +1,43 @@
 import { Groq } from 'groq-sdk';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { z } from 'zod';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
+import { normalizeNigerianMarketNumbers } from './parser.service';
+
+// ─────────────────────────────────────────────────────────────
+// Output schema — every LLM response (Groq, Gemini, or the local
+// fallback) is validated against this before anything downstream
+// trusts it. If it doesn't match, we treat it as a failed call.
+// ─────────────────────────────────────────────────────────────
+const TransactionItemSchema = z.object({
+  type: z.enum(['income', 'expense', 'gain', 'loss']).nullable(),
+  amount: z.number().nullable(),
+  currency: z.literal('NGN').default('NGN'),
+  category: z.string().nullable(),
+  description: z.string(),
+  date: z.string(), // YYYY-MM-DD
+  business_name: z.string().nullable(),
+});
+
+const ParsedMessageSchema = z.object({
+  needs_clarification: z.boolean(),
+  clarification_question: z.string().nullable(),
+  is_batch: z.boolean(),
+  isSummaryQuery: z.boolean().default(false),
+  queryPeriod: z.enum(['today', 'week', 'month']).optional(),
+  isExportRequest: z.boolean().default(false),
+  isCorrection: z.boolean().default(false),
+  correctedCategory: z.string().optional(),
+  items: z.array(TransactionItemSchema),
+});
+
+export type ParsedMessage = z.infer<typeof ParsedMessageSchema>;
+
+export interface UserContext {
+  businessName: string | null;
+  knownCategories: string[];
+}
 
 export class LLMService {
   private groqClient: Groq | null = null;
@@ -17,218 +53,282 @@ export class LLMService {
   }
 
   /**
-   * Generate text completion using Groq (Llama 3.3 70B) primary, with Gemini Flash fallback
+   * Parse a raw WhatsApp message into a structured, validated
+   * transaction. Number shorthand is normalized ONCE, up front, so
+   * Groq, Gemini, and the last-resort fallback all see the same
+   * clean input — this was silently skipped before for both real
+   * LLM calls.
+   */
+  async parseMessage(rawText: string, ctx: UserContext): Promise<ParsedMessage> {
+    const normalizedText = normalizeNigerianMarketNumbers(rawText);
+    const systemPrompt = buildSystemPrompt(ctx);
+    const today = new Date().toISOString().split('T')[0];
+    const userPrompt = `today_date: ${today}\nis_batch: false\nmessage_text: "${normalizedText}"`;
+
+    // 1. Groq — primary. One retry with backoff on rate limits/transient errors.
+    if (this.groqClient) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const completion = await this.groqClient.chat.completions.create({
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            model: 'llama-3.3-70b-versatile',
+            temperature: 0.1,
+            response_format: { type: 'json_object' },
+          });
+          const raw = completion.choices[0]?.message?.content || '';
+          const parsed = safeParseAndValidate(raw);
+          if (parsed) {
+            logger.llm('Groq Llama 3.3 70B', userPrompt, raw);
+            return parsed;
+          }
+          logger.warn(`Groq returned invalid/unvalidatable JSON on attempt ${attempt + 1}`);
+        } catch (err: any) {
+          logger.warn(`Groq call failed (attempt ${attempt + 1}):`, err.message);
+          if (err.status === 429) await sleep(500 * (attempt + 1));
+        }
+      }
+    } else {
+      logger.info('Groq API key not configured, going straight to Gemini');
+    }
+
+    // 2. Gemini — fallback, JSON mode forced via generationConfig so we're
+    // not hoping the model remembers to skip markdown fences / prose.
+    if (this.geminiClient) {
+      try {
+        const model = this.geminiClient.getGenerativeModel({
+          model: 'gemini-2.5-flash',
+          generationConfig: { responseMimeType: 'application/json' },
+        });
+        const response = await model.generateContent(`${systemPrompt}\n\n${userPrompt}`);
+        const raw = response.response.text() || '';
+        const parsed = safeParseAndValidate(raw);
+        if (parsed) {
+          logger.llm('Gemini 2.5 Flash', userPrompt, raw);
+          return parsed;
+        }
+        logger.warn('Gemini returned invalid/unvalidatable JSON');
+      } catch (err: any) {
+        logger.warn('Gemini call failed:', err.message);
+      }
+    }
+
+    // 3. Last resort ONLY — both providers unreachable or misconfigured.
+    // Deliberately conservative: when unsure of direction, it asks rather
+    // than guesses, same as the LLM system prompt does. This should be
+    // rare in production if retries/backoff above are working; if you see
+    // this path firing often, that's a signal to fix upstream reliability,
+    // not to make the keyword list smarter.
+    logger.warn('Both LLM providers failed — using heuristic fallback');
+    return heuristicFallback(normalizedText, today, ctx);
+  }
+
+  /**
+   * Free-text generation — used by reply.service.ts to write the
+   * conversational WhatsApp reply (NOT structured JSON). Same
+   * Groq-primary/Gemini-fallback order as parseMessage, but no JSON
+   * mode and no schema validation, since the output here is just text.
    */
   async generateCompletion(prompt: string, systemPrompt?: string): Promise<string> {
-    // 1. Try Primary LLM: Groq Llama 3.3 70B
     if (this.groqClient) {
       try {
-        logger.info('Calling Groq API (llama-3.3-70b-versatile)...');
         const completion = await this.groqClient.chat.completions.create({
           messages: [
             ...(systemPrompt ? [{ role: 'system' as const, content: systemPrompt }] : []),
             { role: 'user' as const, content: prompt },
           ],
           model: 'llama-3.3-70b-versatile',
-          temperature: 0.1,
-          response_format: { type: 'json_object' },
+          temperature: 0.7, // higher than the parser — replies should feel natural, not deterministic
         });
-
-        const rawOutput = completion.choices[0]?.message?.content || '';
-        logger.llm('Groq Llama 3.3 70B', prompt, rawOutput);
-        if (rawOutput) return rawOutput;
-      } catch (groqError: any) {
-        logger.warn('Groq API call failed or rate-limited:', groqError.message);
+        const raw = completion.choices[0]?.message?.content || '';
+        if (raw) {
+          logger.llm('Groq Llama 3.3 70B (reply)', prompt, raw);
+          return raw;
+        }
+      } catch (err: any) {
+        logger.warn('Groq reply generation failed:', err.message);
       }
-    } else {
-      logger.info('Groq API Key not configured, defaulting to Gemini Flash fallback');
     }
 
-    // 2. Fallback LLM: Google Gemini Flash
     if (this.geminiClient) {
       try {
-        logger.info('Calling Gemini Flash fallback (gemini-1.5-flash)...');
+        const model = this.geminiClient.getGenerativeModel({ model: 'gemini-2.5-flash' });
         const fullPrompt = `${systemPrompt ? systemPrompt + '\n\n' : ''}${prompt}`;
-        const model = this.geminiClient.getGenerativeModel({ model: 'gemini-1.5-flash' });
         const response = await model.generateContent(fullPrompt);
-
-        const rawOutput = response.response.text() || '';
-        logger.llm('Google Gemini Flash', prompt, rawOutput);
-        if (rawOutput) return rawOutput;
-      } catch (geminiError: any) {
-        logger.warn('Gemini Flash API call failed:', geminiError.message);
+        const raw = response.response.text() || '';
+        if (raw) {
+          logger.llm('Gemini 2.5 Flash (reply)', prompt, raw);
+          return raw;
+        }
+      } catch (err: any) {
+        logger.warn('Gemini reply generation failed:', err.message);
       }
     }
 
-    // 3. Heuristic Mock Fallback if no API keys are provided or all failed
-    logger.warn('Using rule-based mock LLM parser fallback for development');
-    return this.mockLLMFallback(prompt);
+    // Last resort: a plain, honest reply rather than nothing.
+    logger.warn('Both LLM providers failed — returning generic reply text');
+    return "Got it — noted. (I'm having trouble phrasing this nicely right now, but your entry was saved.)";
   }
+}
 
-  /**
-   * Rule-based local parser when APIs are offline or unconfigured
-   */
-  private mockLLMFallback(prompt: string): string {
-    const userMsgMatch = prompt.match(/Parse this incoming WhatsApp message from a business owner: "([^"]+)"/);
-    const text = (userMsgMatch ? userMsgMatch[1] : prompt).toLowerCase().trim();
-    const today = new Date().toISOString().split('T')[0];
-    
-    // 1. Check if summary query
-    if (
-      text.includes('how much') ||
-      text.includes('summary') ||
-      text.includes('spent this month') ||
-      text.includes('expenses this month') ||
-      text.includes('show expenses') ||
-      text.includes('made this week') ||
-      text.includes('made today') ||
-      text.includes('income today') ||
-      text.includes('profit this') ||
-      text.includes('track my money') ||
-      text.includes('track money') ||
-      text.includes('track expenses') ||
-      text.includes('track sales')
-    ) {
-      let queryPeriod: 'today' | 'week' | 'month' = 'month';
-      if (text.includes('week')) queryPeriod = 'week';
-      else if (text.includes('today') || text.includes('today\'s')) queryPeriod = 'today';
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-      return JSON.stringify({
-        needs_clarification: false,
-        clarification_question: null,
-        is_batch: false,
-        isSummaryQuery: true,
-        queryPeriod,
-        isExportRequest: false,
-        isCorrection: false,
-        items: [],
-      });
+function safeParseAndValidate(raw: string): ParsedMessage | null {
+  try {
+    const cleaned = raw.replace(/```json|```/g, '').trim();
+    const json = JSON.parse(cleaned);
+    return ParsedMessageSchema.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+function buildSystemPrompt(ctx: UserContext): string {
+  return `You are Sayve, a bookkeeping assistant for Nigerian small business owners using WhatsApp. Turn informal messages into structured financial records. Ask a clarifying question whenever something important is missing or ambiguous — never guess silently on anything that affects the numbers in a report.
+
+CONTEXT:
+business_name: ${ctx.businessName ?? 'null (not set — must ask before saving)'}
+known_categories: ${ctx.knownCategories.length ? ctx.knownCategories.join(', ') : 'none yet'}
+
+TASKS, IN ORDER:
+1. TYPE — classify as income, expense, gain, or loss. If unclear (e.g. "600000 fuel" with no verb), set needs_clarification true and ask "Is this money coming in or going out?". Recognize local phrasing without asking: sold/received/customer paid -> income; bought/spent on/paid for -> expense; profit from/dash/bonus -> gain; lost/spoilt/damaged/stolen/wrote off -> loss.
+2. AMOUNT — numbers arrive pre-normalized (1k -> 1000, 600k -> 600000). If missing, ask. If several numbers appear, use the total transaction amount; put quantities/units in description.
+3. CATEGORY — match known_categories first (fuzzy: fuel/petrol/diesel may be one category). If nothing matches and it's not obvious, ask "What category should I file this under?".
+4. PERIOD — look for explicit date words ("yesterday", "last Monday"). If none, default to today_date; do not ask about period for ordinary single messages. Only ask for period on a clearly ambiguous backlog dump.
+5. BUSINESS — if business_name is null, always ask "Which business is this for?". If set, attach it silently.
+6. BATCH (is_batch true) — extract every line item into items[]. Don't ask type/period per item; group by type if types clearly differ, otherwise ask once for the whole batch. Always return the extracted list for user confirmation.
+
+Respond ONLY with valid JSON matching this shape, no preamble, no markdown fences:
+{
+  "needs_clarification": boolean,
+  "clarification_question": string | null,
+  "is_batch": boolean,
+  "isSummaryQuery": boolean,
+  "queryPeriod": "today" | "week" | "month" | null,
+  "isExportRequest": boolean,
+  "isCorrection": boolean,
+  "correctedCategory": string | null,
+  "items": [
+    {
+      "type": "income" | "expense" | "gain" | "loss" | null,
+      "amount": number | null,
+      "currency": "NGN",
+      "category": string | null,
+      "description": string,
+      "date": "YYYY-MM-DD",
+      "business_name": string | null
     }
+  ]
+}
 
-    // 2. Check if export request (handles typos like 'cvs', 'excel', 'report', 'download')
-    if (
-      text.includes('send my report') ||
-      text.includes('export') ||
-      text.includes('csv') ||
-      text.includes('cvs') ||
-      text.includes('report') ||
-      text.includes('excel') ||
-      text.includes('download') ||
-      text.includes('spreadsheet') ||
-      text.includes('file')
-    ) {
-      return JSON.stringify({
-        needs_clarification: false,
-        clarification_question: null,
-        is_batch: false,
-        isSummaryQuery: false,
-        isExportRequest: true,
-        isCorrection: false,
-        items: [],
-      });
-    }
+Never invent a business name, category, or amount. When unsure, ask one short, specific, conversational question — this is WhatsApp, not a form.`;
+}
 
-    // 3. Check if correction request
-    if (text.startsWith('no,') || text.includes("it's") || text.includes('change category')) {
-      let category = 'Other';
-      if (text.includes('rent')) category = 'Rent';
-      else if (text.includes('sales') || text.includes('sale')) category = 'Sales';
-      else if (text.includes('transport')) category = 'Transport';
-      else if (text.includes('inventory') || text.includes('stock')) category = 'Inventory';
-      else if (text.includes('salaries') || text.includes('salary')) category = 'Salaries';
-      else if (text.includes('utility') || text.includes('bill') || text.includes('nepa')) category = 'Utilities';
+/**
+ * Rule-based local parser — LAST RESORT ONLY, used when both Groq and
+ * Gemini are unreachable. Kept intentionally conservative: on ambiguous
+ * direction, it asks rather than guesses.
+ */
+function heuristicFallback(text: string, today: string, ctx: UserContext): ParsedMessage {
+  const lower = text.toLowerCase().trim();
 
-      return JSON.stringify({
-        needs_clarification: false,
-        clarification_question: null,
-        is_batch: false,
-        isSummaryQuery: false,
-        isExportRequest: false,
-        isCorrection: true,
-        correctedCategory: category,
-        items: [],
-      });
-    }
-
-    // Import normalizer
-    const { normalizeNigerianMarketNumbers } = require('./parser.service');
-
-    // 4. Transaction parsing heuristic
-    const isIncome = text.includes('sold') || text.includes('sale') || text.includes('received') || text.includes('paid me') || text.includes('alert') || text.includes('cash enter') || text.includes('income') || text.includes('made') || text.includes('make') || text.includes('earn') || text.includes('earned') || text.includes('collect');
-    const isExpense = text.includes('spent') || text.includes('bought') || text.includes('paid for') || text.includes('pay') || text.includes('cost') || text.includes('chop money') || text.includes('expense');
-    const isGain = text.includes('profit') || text.includes('dash') || text.includes('bonus') || text.includes('gain');
-    const isLoss = text.includes('loss') || text.includes('lost') || text.includes('spoilt') || text.includes('damaged') || text.includes('stolen') || text.includes('spill') || text.includes('wrote off');
-
-    let type: 'income' | 'expense' | 'gain' | 'loss' | null = null;
-    if (isLoss) type = 'loss';
-    else if (isGain) type = 'gain';
-    else if (isExpense) type = 'expense';
-    else if (isIncome) type = 'income';
-
-    // Normalize Nigerian market numbers (e.g. 3k -> 3000, 2.4k -> 2400, 2k5 -> 2500)
-    const normalizedText = normalizeNigerianMarketNumbers(text);
-
-    // Extract numbers
-    const numbers = normalizedText.match(/\d+[\d,]*/g);
-    let amount: number | null = null;
-    if (numbers && numbers.length > 0) {
-      const parsedNums = numbers.map((n: string) => parseInt(n.replace(/,/g, ''), 10));
-      amount = Math.max(...parsedNums);
-    }
-
-    // Check if clarification needed (ambiguous direction e.g. "600000 fuel" without bought/sold/spent)
-    if (!type && amount !== null) {
-      return JSON.stringify({
-        needs_clarification: true,
-        clarification_question: "Is this money coming in or going out?",
-        is_batch: false,
-        items: [
-          {
-            type: null,
-            amount,
-            currency: 'NGN',
-            category: 'Fuel',
-            description: text,
-            date: today,
-            business_name: null,
-          },
-        ],
-      });
-    }
-
-    // Default direction if not explicit
-    type = type || (isExpense ? 'expense' : 'income');
-
-    // Category detection
-    let category = 'Other';
-    if (text.includes('transport') || text.includes('bus') || text.includes('okada') || text.includes('cab')) category = 'Transport';
-    else if (text.includes('fuel') || text.includes('petrol') || text.includes('diesel') || text.includes('gen')) category = 'Fuel';
-    else if (text.includes('rice') || text.includes('sold') || text.includes('sales')) category = 'Sales';
-    else if (text.includes('stock') || text.includes('goods') || text.includes('bag')) category = 'Inventory';
-    else if (text.includes('light') || text.includes('nepa') || text.includes('water')) category = 'Utilities';
-    else if (text.includes('rent') || text.includes('shop')) category = 'Rent';
-    else if (text.includes('salary') || text.includes('staff')) category = 'Salaries';
-
-    return JSON.stringify({
-      needs_clarification: false,
-      clarification_question: null,
-      is_batch: false,
-      isSummaryQuery: false,
-      isExportRequest: false,
-      isCorrection: false,
-      items: [
-        {
-          type,
-          amount: amount || 0,
-          currency: 'NGN',
-          category,
-          description: text.substring(0, 100),
-          date: today,
-          business_name: null,
-        },
-      ],
+  // Summary queries
+  if (
+    lower.includes('how much') || lower.includes('summary') ||
+    lower.includes('spent this month') || lower.includes('expenses this month') ||
+    lower.includes('made this week') || lower.includes('made today') ||
+    lower.includes('income today') || lower.includes('profit this')
+  ) {
+    let queryPeriod: 'today' | 'week' | 'month' = 'month';
+    if (lower.includes('week')) queryPeriod = 'week';
+    else if (lower.includes('today')) queryPeriod = 'today';
+    return ParsedMessageSchema.parse({
+      needs_clarification: false, clarification_question: null, is_batch: false,
+      isSummaryQuery: true, queryPeriod, isExportRequest: false, isCorrection: false, items: [],
     });
   }
+
+  // Export requests
+  if (['export', 'csv', 'cvs', 'report', 'excel', 'download', 'spreadsheet', 'pdf', 'image'].some(k => lower.includes(k))) {
+    return ParsedMessageSchema.parse({
+      needs_clarification: false, clarification_question: null, is_batch: false,
+      isSummaryQuery: false, isExportRequest: true, isCorrection: false, items: [],
+    });
+  }
+
+  // Corrections
+  if (lower.startsWith('no,') || lower.includes("it's") || lower.includes('change category')) {
+    const categoryMap: [string, string][] = [
+      ['rent', 'Rent'], ['sales', 'Sales'], ['sale', 'Sales'], ['transport', 'Transport'],
+      ['inventory', 'Inventory'], ['stock', 'Inventory'], ['salary', 'Salaries'],
+      ['salaries', 'Salaries'], ['utility', 'Utilities'], ['bill', 'Utilities'], ['nepa', 'Utilities'],
+    ];
+    const match = categoryMap.find(([kw]) => lower.includes(kw));
+    return ParsedMessageSchema.parse({
+      needs_clarification: false, clarification_question: null, is_batch: false,
+      isSummaryQuery: false, isExportRequest: false, isCorrection: true,
+      correctedCategory: match ? match[1] : 'Other', items: [],
+    });
+  }
+
+  // Transaction parsing
+  const isIncome = ['sold', 'sale', 'received', 'paid me', 'alert', 'cash enter', 'made', 'earn', 'earned', 'collect'].some(k => lower.includes(k));
+  const isExpense = ['spent', 'bought', 'paid for', 'chop money', 'expense'].some(k => lower.includes(k));
+  const isGain = ['profit', 'dash', 'bonus', 'gain'].some(k => lower.includes(k));
+  const isLoss = ['loss', 'lost', 'spoilt', 'damaged', 'stolen', 'spill', 'wrote off'].some(k => lower.includes(k));
+
+  let type: 'income' | 'expense' | 'gain' | 'loss' | null = null;
+  if (isLoss) type = 'loss';
+  else if (isGain) type = 'gain';
+  else if (isExpense) type = 'expense';
+  else if (isIncome) type = 'income';
+
+  const numbers = text.match(/\d+[\d,]*/g);
+  const amount = numbers?.length ? Math.max(...numbers.map(n => parseInt(n.replace(/,/g, ''), 10))) : null;
+
+  // Ambiguous direction — ask rather than guess
+  if (!type && amount !== null) {
+    return ParsedMessageSchema.parse({
+      needs_clarification: true,
+      clarification_question: 'Is this money coming in or going out?',
+      is_batch: false, isSummaryQuery: false, isExportRequest: false, isCorrection: false,
+      items: [{ type: null, amount, currency: 'NGN', category: null, description: text, date: today, business_name: ctx.businessName }],
+    });
+  }
+
+  if (!type || amount === null) {
+    return ParsedMessageSchema.parse({
+      needs_clarification: true,
+      clarification_question: !type ? 'Is this money coming in or going out?' : 'How much was this for?',
+      is_batch: false, isSummaryQuery: false, isExportRequest: false, isCorrection: false,
+      items: [{ type, amount, currency: 'NGN', category: null, description: text, date: today, business_name: ctx.businessName }],
+    });
+  }
+
+  const categoryMap: [string, string][] = [
+    ['transport', 'Transport'], ['bus', 'Transport'], ['okada', 'Transport'], ['cab', 'Transport'],
+    ['fuel', 'Fuel'], ['petrol', 'Fuel'], ['diesel', 'Fuel'], ['gen', 'Fuel'],
+    ['sold', 'Sales'], ['sales', 'Sales'], ['rice', 'Sales'],
+    ['stock', 'Inventory'], ['goods', 'Inventory'], ['bag', 'Inventory'],
+    ['light', 'Utilities'], ['nepa', 'Utilities'], ['water', 'Utilities'],
+    ['rent', 'Rent'], ['shop', 'Rent'],
+    ['salary', 'Salaries'], ['staff', 'Salaries'],
+  ];
+  const categoryMatch = categoryMap.find(([kw]) => lower.includes(kw));
+
+  return ParsedMessageSchema.parse({
+    needs_clarification: false, clarification_question: null, is_batch: false,
+    isSummaryQuery: false, isExportRequest: false, isCorrection: false,
+    items: [{
+      type, amount, currency: 'NGN',
+      category: categoryMatch ? categoryMatch[1] : 'Other',
+      description: text.substring(0, 100), date: today, business_name: ctx.businessName,
+    }],
+  });
 }
 
 export const llmService = new LLMService();
