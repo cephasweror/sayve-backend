@@ -34,7 +34,7 @@ export class SummaryService {
       const categoryBreakdown: Record<string, number> = {};
 
       for (const tx of transactions) {
-        if (tx.type === 'income') {
+        if (tx.type === 'income' || tx.type === 'gain') {
           totalIncome += tx.amount;
         } else {
           totalExpenses += tx.amount;
