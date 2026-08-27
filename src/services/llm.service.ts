@@ -150,8 +150,11 @@ export class LLMService {
       });
     }
 
+    // Import normalizer
+    const { normalizeNigerianMarketNumbers } = require('./parser.service');
+
     // 4. Transaction parsing heuristic
-    const isIncome = text.includes('sold') || text.includes('sale') || text.includes('received') || text.includes('paid me') || text.includes('alert') || text.includes('cash enter') || text.includes('income');
+    const isIncome = text.includes('sold') || text.includes('sale') || text.includes('received') || text.includes('paid me') || text.includes('alert') || text.includes('cash enter') || text.includes('income') || text.includes('made') || text.includes('make') || text.includes('earn') || text.includes('earned') || text.includes('collect');
     const isExpense = text.includes('spent') || text.includes('bought') || text.includes('paid for') || text.includes('pay') || text.includes('cost') || text.includes('chop money') || text.includes('expense');
     const isGain = text.includes('profit') || text.includes('dash') || text.includes('bonus') || text.includes('gain');
     const isLoss = text.includes('loss') || text.includes('lost') || text.includes('spoilt') || text.includes('damaged') || text.includes('stolen') || text.includes('spill') || text.includes('wrote off');
@@ -162,16 +165,14 @@ export class LLMService {
     else if (isExpense) type = 'expense';
     else if (isIncome) type = 'income';
 
-    // Expand shorthand numbers (e.g. 5k -> 5000, 1.5k -> 1500, 2m -> 2000000)
-    const normalizedText = text
-      .replace(/(\d+(?:\.\d+)?)\s*k\b/gi, (_, n) => String(parseFloat(n) * 1000))
-      .replace(/(\d+(?:\.\d+)?)\s*m\b/gi, (_, n) => String(parseFloat(n) * 1000000));
+    // Normalize Nigerian market numbers (e.g. 3k -> 3000, 2.4k -> 2400, 2k5 -> 2500)
+    const normalizedText = normalizeNigerianMarketNumbers(text);
 
     // Extract numbers
     const numbers = normalizedText.match(/\d+[\d,]*/g);
     let amount: number | null = null;
     if (numbers && numbers.length > 0) {
-      const parsedNums = numbers.map(n => parseInt(n.replace(/,/g, ''), 10));
+      const parsedNums = numbers.map((n: string) => parseInt(n.replace(/,/g, ''), 10));
       amount = Math.max(...parsedNums);
     }
 
