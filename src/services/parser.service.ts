@@ -45,20 +45,24 @@ export interface ParserContext {
  */
 export function normalizeNigerianMarketNumbers(text: string): string {
   return text
-    // Handle "2k5", "3k500", "10k5"
-    .replace(/\b(\d+)\s*k\s*(\d{1,3})\b/gi, (_, thousands, hundreds) => {
+    // 1. Handle "2k5", "3k500", "10k5" -> 2500, 3500, 10500
+    .replace(/\b(\d+)\s*k\s*(\d{1,3})\b(?![a-z])/gi, (_, thousands, hundreds) => {
       const h = hundreds.padEnd(3, '0').substring(0, 3);
       return String(parseInt(thousands, 10) * 1000 + parseInt(h, 10));
     })
-    // Handle "1m2"
-    .replace(/\b(\d+)\s*m\s*(\d{1,3})\b/gi, (_, millions, hundreds) => {
+    // 2. Handle "1m2" -> 1200000
+    .replace(/\b(\d+)\s*m\s*(\d{1,3})\b(?![a-z])/gi, (_, millions, hundreds) => {
       const h = hundreds.padEnd(3, '0').substring(0, 3);
       return String(parseInt(millions, 10) * 1000000 + parseInt(h, 10) * 1000);
     })
-    // Handle standard "5k", "1.5k", "500k"
-    .replace(/\b(\d+(?:\.\d+)?)\s*k\b/gi, (_, n) => String(Math.round(parseFloat(n) * 1000)))
-    // Handle standard "1m", "1.2m"
-    .replace(/\b(\d+(?:\.\d+)?)\s*m\b/gi, (_, n) => String(Math.round(parseFloat(n) * 1000000)));
+    // 3. Generic 1k, 1K, 1 k, 5k, 1.5k, 600k (negative lookahead avoids 1kg, 1km, 1kwh)
+    .replace(/\b(\d+(?:\.\d+)?)\s*k\b(?![a-z])/gi, (_, n) => String(Math.round(parseFloat(n) * 1000)))
+    // 4. Generic 1m, 1.2m, 2m
+    .replace(/\b(\d+(?:\.\d+)?)\s*m\b(?![a-z])/gi, (_, n) => String(Math.round(parseFloat(n) * 1000000)))
+    // 5. Explicit words "thousand", "million", "billion"
+    .replace(/\b(\d+(?:\.\d+)?)\s*thousand\b/gi, (_, n) => String(Math.round(parseFloat(n) * 1000)))
+    .replace(/\b(\d+(?:\.\d+)?)\s*million\b/gi, (_, n) => String(Math.round(parseFloat(n) * 1000000)))
+    .replace(/\b(\d+(?:\.\d+)?)\s*billion\b/gi, (_, n) => String(Math.round(parseFloat(n) * 1000000000)));
 }
 
 const SYSTEM_PROMPT = `

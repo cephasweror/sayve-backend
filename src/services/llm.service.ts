@@ -38,7 +38,7 @@ export class LLMService {
         logger.llm('Groq Llama 3.3 70B', prompt, rawOutput);
         if (rawOutput) return rawOutput;
       } catch (groqError: any) {
-        logger.warn('Groq API call failed or rate-limited. Falling back to Gemini Flash:', groqError.message);
+        logger.warn('Groq API call failed or rate-limited:', groqError.message);
       }
     } else {
       logger.info('Groq API Key not configured, defaulting to Gemini Flash fallback');
@@ -47,7 +47,7 @@ export class LLMService {
     // 2. Fallback LLM: Google Gemini Flash
     if (this.geminiClient) {
       try {
-        logger.info('Calling Gemini Flash fallback...');
+        logger.info('Calling Gemini Flash fallback (gemini-1.5-flash)...');
         const fullPrompt = `${systemPrompt ? systemPrompt + '\n\n' : ''}${prompt}`;
         const model = this.geminiClient.getGenerativeModel({ model: 'gemini-1.5-flash' });
         const response = await model.generateContent(fullPrompt);
@@ -56,7 +56,7 @@ export class LLMService {
         logger.llm('Google Gemini Flash', prompt, rawOutput);
         if (rawOutput) return rawOutput;
       } catch (geminiError: any) {
-        logger.error('Gemini Flash API call also failed:', geminiError.message);
+        logger.warn('Gemini Flash API call failed:', geminiError.message);
       }
     }
 
