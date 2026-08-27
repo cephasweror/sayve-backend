@@ -33,62 +33,75 @@ export interface ParserContext {
   is_batch?: boolean;
 }
 
-const SYSTEM_PROMPT = `
-You are an AI financial record assistant for Nigerian small business owners using WhatsApp.
-Your job is to turn informal messages (English, Nigerian Pidgin, or mixed slang) into structured financial records.
-Ask a clarifying question whenever something important is missing or ambiguous — NEVER guess silently on anything that affects the numbers in a report.
+/**
+ * Normalizes Nigerian market number expressions:
+ * - "2k5" / "2K5" -> "2500"
+ * - "3k500" -> "3500"
+ * - "10k5" -> "10500"
+ * - "1m2" -> "1200000"
+ * - "5k" -> "5000"
+ * - "1.5k" -> "1500"
+ * - "2m" -> "2000000"
+ */
+export function normalizeNigerianMarketNumbers(text: string): string {
+  return text
+    // Handle "2k5", "3k500", "10k5"
+    .replace(/\b(\d+)\s*k\s*(\d{1,3})\b/gi, (_, thousands, hundreds) => {
+      const h = hundreds.padEnd(3, '0').substring(0, 3);
+      return String(parseInt(thousands, 10) * 1000 + parseInt(h, 10));
+    })
+    // Handle "1m2"
+    .replace(/\b(\d+)\s*m\s*(\d{1,3})\b/gi, (_, millions, hundreds) => {
+      const h = hundreds.padEnd(3, '0').substring(0, 3);
+      return String(parseInt(millions, 10) * 1000000 + parseInt(h, 10) * 1000);
+    })
+    // Handle standard "5k", "1.5k", "500k"
+    .replace(/\b(\d+(?:\.\d+)?)\s*k\b/gi, (_, n) => String(Math.round(parseFloat(n) * 1000)))
+    // Handle standard "1m", "1.2m"
+    .replace(/\b(\d+(?:\.\d+)?)\s*m\b/gi, (_, n) => String(Math.round(parseFloat(n) * 1000000)));
+}
 
-CONTEXT PROVIDED TO YOU EACH TURN:
-- business_name: string or null
-- known_categories: array of strings previously used by this business
-- today_date: YYYY-MM-DD
-- message_text: normalized message
-- is_batch: boolean
+const SYSTEM_PROMPT = `
+You are an expert AI financial record assistant for Nigerian small business owners and market traders using WhatsApp.
+You deeply understand Nigerian Market English, Pidgin, local business slangs, and trade phrasing.
 
 YOUR TASKS, IN ORDER:
 
-1. IDENTIFY COMMANDS OR NON-TRANSACTION INTENTS FIRST:
-   - If user asks for financial summary or value over time ("how much did I make", "track my money for today", "how far today", "show my level", "my total balance", "how money move this week", "make I see breakdown"):
+1. IDENTIFY COMMANDS / FINANCIAL OVERVIEW QUERIES:
+   - If user asks about their sales, profit, or market status ("how market be today", "how much I make", "track my money for today", "how far today", "show my level", "my total balance", "how money move this week", "make I see my breakdown"):
      Set "isSummaryQuery": true, "queryPeriod": "today" | "week" | "month", "needs_clarification": false, "items": [].
-   - If user asks for data file or report export ("send report", "export csv", "CVS", "excel", "report sheet", "download file", "send statement", "document", "history"):
+   - If user asks for file, statement, or report export ("send report", "export csv", "CVS", "excel", "report sheet", "download file", "send statement", "send my book", "document", "history"):
      Set "isExportRequest": true, "needs_clarification": false, "items": [].
    - If user is correcting a category ("no, it's Rent", "change category to Transport"):
      Set "isCorrection": true, "correctedCategory": string, "needs_clarification": false, "items": [].
 
-2. IDENTIFY TYPE
-   Classify each transaction item as one of: income, expense, gain, loss.
-   - If the message doesn't make this clear (e.g. just "600000 fuel"), do NOT guess. Set "needs_clarification": true and ask:
-     "Is this money coming in or going out?"
-   - Common Nigerian small-business phrasing to recognize without asking:
-     "sold", "customer paid", "received", "alert", "cash enter", "sales today" -> income
-     "bought", "paid for", "spent on", "chop money", "fuel gen", "give boys", "pay transport" -> expense
-     "profit from", "extra from", "dash", "bonus" -> gain
-     "lost", "damaged", "spoilt", "wrote off", "stolen", "spill" -> loss
+2. IDENTIFY TRANSACTION TYPE (income, expense, gain, loss):
+   - Recognize Nigerian Market & Pidgin Phrasing:
+     * INCOME: "sold", "customer paid", "received", "alert", "cash enter", "sales today", "somebody buy", "collect money from", "sell 3 mudu"
+     * EXPENSE: "bought", "paid for", "spent on", "chop money", "fuel gen", "give boys", "pay transport", "okada", "keke", "buy market", "feeding", "staff salary", "nepa bill", "light bill"
+     * GAIN: "profit from", "extra from", "dash", "bonus", "tips", "gift"
+     * LOSS: "lost", "damaged", "spoilt", "wrote off", "stolen", "spill", "police chop", "task force take"
+   - If type is ambiguous (e.g. just "600000 fuel"), set "needs_clarification": true and ask: "Is this money coming in or going out?"
 
-3. IDENTIFY AMOUNT
-   Numbers arrive already normalized. If no amount is present at all, set "needs_clarification": true and ask for it.
-   If more than one number appears and it's unclear which is the transaction amount (e.g. "bought 5 bags of rice for 200k"), pick the total (200000) and note the quantity/unit in "description", not "amount".
+3. IDENTIFY AMOUNT:
+   Amounts arrive normalized. If no amount is mentioned at all, set "needs_clarification": true and ask for it.
+   If quantity & total exist (e.g. "sell 3 bags of rice for 45000"), pick total (45000) as amount and note quantity in description.
 
-4. IDENTIFY CATEGORY
-   Match against known_categories first (fuzzy match: "fuel"/"petrol"/"diesel").
-   If nothing matches and it's not obvious, set "needs_clarification": true and ask: "What category should I file this under?"
-   Otherwise infer from common categories: Inventory, Transport, Rent, Salaries, Utilities, Sales, Food, Fuel, Other.
+4. IDENTIFY CATEGORY:
+   Match against known_categories first.
+   Common categories: Sales, Inventory, Transport, Fuel, Rent, Salaries, Utilities, Food, Other.
 
-5. IDENTIFY PERIOD
-   Look for explicit dates/days ("yesterday", "last Monday", "3rd of August").
-   If none is present, default to today_date — do NOT ask about period for single, real-time-sounding messages.
+5. IDENTIFY PERIOD:
+   Default to today_date if no date is specified.
 
-6. IDENTIFY BUSINESS
-   If business_name is null AND the message is logging a transaction, set "needs_clarification": true and ask:
-   "Which business is this for? (You can set a default so I stop asking.)"
+6. IDENTIFY BUSINESS:
+   If business_name is null AND logging a transaction, set "needs_clarification": true and ask: "Which business is this for?"
 
-7. BATCH / LIST HANDLING (is_batch = true)
-   - Extract every line item you can find, each with its own amount/description.
-   - Always return the full extracted list in "items".
+7. BATCH LIST HANDLING (is_batch = true):
+   Extract every line item found into the "items" array.
 
-RESPONSE FORMAT
-Respond ONLY with valid JSON, no preamble, no markdown fences:
-
+RESPONSE FORMAT:
+Respond ONLY with valid JSON:
 {
   "needs_clarification": boolean,
   "clarification_question": string | null,
@@ -123,10 +136,8 @@ export class ParserService {
       const knownCategories = context?.known_categories || ['Sales', 'Inventory', 'Transport', 'Utilities', 'Salaries', 'Rent', 'Food', 'Fuel', 'Other'];
       const isBatch = Boolean(context?.is_batch);
 
-      // Pre-normalize number shorthand (e.g. 5k -> 5000, 600k -> 600000, 1.5k -> 1500)
-      const normalizedMessage = userMessage
-        .replace(/(\d+(?:\.\d+)?)\s*k\b/gi, (_, n) => String(parseFloat(n) * 1000))
-        .replace(/(\d+(?:\.\d+)?)\s*m\b/gi, (_, n) => String(parseFloat(n) * 1000000));
+      // Normalize Nigerian market numbers (e.g. 2k5 -> 2500, 3k500 -> 3500, 1m2 -> 1200000, 500k -> 500000)
+      const normalizedMessage = normalizeNigerianMarketNumbers(userMessage);
 
       const promptContext = JSON.stringify({
         business_name: businessName,
@@ -143,13 +154,23 @@ export class ParserService {
       const cleanJson = rawJson.replace(/```json/g, '').replace(/```/g, '').trim();
       const parsed = JSON.parse(cleanJson);
 
+      let queryPeriod: 'today' | 'week' | 'month' = 'month';
+      const lower = userMessage.toLowerCase();
+      if (lower.includes('today') || lower.includes('for today') || lower.includes("today's")) {
+        queryPeriod = 'today';
+      } else if (lower.includes('week') || lower.includes('this week')) {
+        queryPeriod = 'week';
+      } else if (parsed.queryPeriod && ['today', 'week', 'month'].includes(parsed.queryPeriod)) {
+        queryPeriod = parsed.queryPeriod;
+      }
+
       return {
         needs_clarification: Boolean(parsed.needs_clarification),
         clarification_question: parsed.clarification_question || null,
         is_batch: Boolean(parsed.is_batch),
         items: Array.isArray(parsed.items) ? parsed.items : [],
         isSummaryQuery: Boolean(parsed.isSummaryQuery),
-        queryPeriod: parsed.queryPeriod || 'month',
+        queryPeriod,
         isExportRequest: Boolean(parsed.isExportRequest),
         isCorrection: Boolean(parsed.isCorrection),
         correctedCategory: parsed.correctedCategory || undefined,
