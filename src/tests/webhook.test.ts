@@ -40,15 +40,24 @@ jest.mock('../services/onboarding.service', () => ({
 jest.mock('../services/parser.service', () => ({
   parserService: {
     parseUserMessage: jest.fn().mockResolvedValue({
-      isTransaction: true,
-      type: 'income',
-      amount: 45000,
-      category: 'Sales',
-      description: 'sold rice',
-      isCorrection: false,
+      needs_clarification: false,
+      clarification_question: null,
+      is_batch: false,
       isSummaryQuery: false,
       isExportRequest: false,
+      isCorrection: false,
       rawText: 'sold 3 bags of rice for 45000',
+      items: [
+        {
+          type: 'income',
+          amount: 45000,
+          currency: 'NGN',
+          category: 'Sales',
+          description: 'sold rice',
+          date: '2026-08-27',
+          business_name: 'Test Shop',
+        },
+      ],
     }),
   },
 }));
@@ -63,6 +72,7 @@ jest.mock('../models/Transaction', () => ({
       description: 'sold rice',
     }),
     findById: jest.fn().mockResolvedValue(null),
+    distinct: jest.fn().mockResolvedValue(['Sales', 'Transport', 'Rent']),
   },
 }));
 

@@ -69,7 +69,7 @@ export class WhatsAppService {
       const form = new FormData();
       form.append('file', fileBuffer, { filename: fileName, contentType: mimeType });
       form.append('messaging_product', 'whatsapp');
-      form.append('type', mimeType);
+      form.append('type', 'document');
 
       const response = await axios.post(`${this.apiUrl}/media`, form, {
         headers: {
