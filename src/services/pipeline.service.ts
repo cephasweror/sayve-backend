@@ -40,10 +40,10 @@ export class PipelineService {
   private geminiClient: GoogleGenerativeAI | null = null;
 
   constructor() {
-    if (env.GROQ_API_KEY && env.GROQ_API_KEY !== 'mock_groq_key') {
+    if (env.GROQ_API_KEY && env.GROQ_API_KEY !== 'mock_groq_key' && !env.GROQ_API_KEY.includes('your_') && env.GROQ_API_KEY.length > 10) {
       this.groqClient = new Groq({ apiKey: env.GROQ_API_KEY });
     }
-    if (env.GEMINI_API_KEY && env.GEMINI_API_KEY !== 'mock_gemini_key') {
+    if (env.GEMINI_API_KEY && env.GEMINI_API_KEY !== 'mock_gemini_key' && !env.GEMINI_API_KEY.includes('your_') && env.GEMINI_API_KEY.length > 10) {
       this.geminiClient = new GoogleGenerativeAI(env.GEMINI_API_KEY);
     }
   }
@@ -136,10 +136,13 @@ A pending question context may be provided. If present, strongly favor classifyi
     pendingClarification?: IPendingClarification | null
   ): IntentCategory {
     if (pendingClarification) {
-      // If user is asked a question and sends a short message (e.g. "expense", "5000", "income", "Sales", "today", "Rent")
-      const isShortReply = lower.split(' ').length <= 4;
-      const startsNewTx = ['sold', 'bought', 'spent', 'received', 'paid'].some(k => lower.startsWith(k));
-      if (isShortReply && !startsNewTx) {
+      const words = lower.split(' ').filter(Boolean);
+      // Single-word or 2-word replies when a question is pending are clarification replies (e.g. "spent", "income", "this week", "Rent")
+      if (words.length <= 2) {
+        return 'clarification_reply';
+      }
+      const startsFullNewTx = ['sold ', 'bought ', 'spent ', 'received ', 'paid '].some(k => lower.startsWith(k)) && /\d+/.test(lower);
+      if (!startsFullNewTx) {
         return 'clarification_reply';
       }
     }
@@ -160,6 +163,9 @@ A pending question context may be provided. If present, strongly favor classifyi
       lower.includes('summary') ||
       lower.includes('how much did i make') ||
       lower.includes('how much i make') ||
+      lower.includes('how much') ||
+      lower.includes('net profit') ||
+      lower.includes('profit') ||
       lower.includes('what\'s my report') ||
       lower.includes('whats my report') ||
       lower.includes('send my summary') ||
@@ -169,7 +175,9 @@ A pending question context may be provided. If present, strongly favor classifyi
       lower.includes('export') ||
       lower.includes('csv') ||
       lower.includes('excel') ||
-      lower.includes('pdf')
+      lower.includes('pdf') ||
+      lower.includes('breakdown') ||
+      lower.includes('balance')
     ) {
       return 'report_request';
     }
@@ -283,7 +291,7 @@ Output: {"type":"unclear","amount":20000,"category":"Other","description":"rice 
   private heuristicExtractTransaction(text: string, knownCategories: string[]): ExtractedTransaction {
     const lower = text.toLowerCase();
     const isIncome = ['sold', 'sale', 'received', 'paid me', 'alert', 'made', 'earned'].some(k => lower.includes(k));
-    const isExpense = ['spent', 'bought', 'paid for', 'cost me', 'expense'].some(k => lower.includes(k));
+    const isExpense = !isIncome && ['spent', 'bought', 'paid', 'cost me', 'expense'].some(k => lower.includes(k));
 
     let type: 'income' | 'expense' | 'unclear' = 'unclear';
     if (isExpense) type = 'expense';
