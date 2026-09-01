@@ -14,7 +14,11 @@ const envSchema = zod_1.z.object({
     PHONE_NUMBER_ID: zod_1.z.string().default('mock_phone_number_id'),
     WHATSAPP_VERIFY_TOKEN: zod_1.z.string().default('sayve_webhook_secret_token'),
     GROQ_API_KEY: zod_1.z.string().default('mock_groq_key'),
+    GROQ_MODEL: zod_1.z.string().default('groq/compound'),
     GEMINI_API_KEY: zod_1.z.string().default('mock_gemini_key'),
+    GEMINI_MODEL: zod_1.z.string().default('gemini-2.5-flash-lite'),
+    OPENROUTER_API_KEY: zod_1.z.string().default('mock_openrouter_key'),
+    OPENROUTER_MODEL: zod_1.z.string().default('meta-llama/llama-3.3-70b-instruct:free'),
     MONGODB_URI: zod_1.z.string().default('mongodb://127.0.0.1:27017/sayve_db'),
 });
 const parsedEnv = envSchema.safeParse(process.env);
@@ -30,6 +34,10 @@ exports.env = parsedEnv.success
         PHONE_NUMBER_ID: process.env.PHONE_NUMBER_ID || 'mock_phone_number_id',
         WHATSAPP_VERIFY_TOKEN: process.env.WHATSAPP_VERIFY_TOKEN || 'sayve_webhook_secret_token',
         GROQ_API_KEY: process.env.GROQ_API_KEY || 'mock_groq_key',
+        GROQ_MODEL: process.env.GROQ_MODEL || 'groq/compound',
         GEMINI_API_KEY: process.env.GEMINI_API_KEY || 'mock_gemini_key',
+        GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
+        OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY || 'mock_openrouter_key',
+        OPENROUTER_MODEL: process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free',
         MONGODB_URI: process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/sayve_db',
     });

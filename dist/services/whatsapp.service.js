@@ -64,7 +64,7 @@ class WhatsAppService {
             const form = new FormData();
             form.append('file', fileBuffer, { filename: fileName, contentType: mimeType });
             form.append('messaging_product', 'whatsapp');
-            form.append('type', mimeType);
+            form.append('type', 'document');
             const response = await axios_1.default.post(`${this.apiUrl}/media`, form, {
                 headers: {
                     Authorization: `Bearer ${this.token}`,
@@ -177,6 +177,86 @@ class WhatsAppService {
         }
         catch (error) {
             logger_1.logger.error(`Error sending document message to ${to}:`, error?.response?.data || error.message);
+            return false;
+        }
+    }
+    /**
+     * Send interactive quick reply buttons (up to 3 buttons) to WhatsApp recipient
+     */
+    async sendButtonMessage(to, bodyText, buttons) {
+        logger_1.logger.info(`Sending WhatsApp interactive buttons to ${to}: "${bodyText.substring(0, 50)}..."`);
+        const formattedButtons = buttons.slice(0, 3).map(btn => ({
+            type: 'reply',
+            reply: {
+                id: btn.id,
+                title: btn.title.substring(0, 20),
+            },
+        }));
+        if (this.token === 'mock_whatsapp_token' || this.phoneNumberId === 'mock_phone_number_id') {
+            logger_1.logger.info(`[MOCK WHATSAPP BUTTON SEND] To: ${to}\nText: ${bodyText}\nButtons: ${JSON.stringify(formattedButtons)}`);
+            return true;
+        }
+        try {
+            const response = await axios_1.default.post(`${this.apiUrl}/messages`, {
+                messaging_product: 'whatsapp',
+                recipient_type: 'individual',
+                to,
+                type: 'interactive',
+                interactive: {
+                    type: 'button',
+                    body: { text: bodyText },
+                    action: { buttons: formattedButtons },
+                },
+            }, {
+                headers: {
+                    Authorization: `Bearer ${this.token}`,
+                    'Content-Type': 'application/json',
+                },
+                timeout: 10000,
+            });
+            logger_1.logger.info(`WhatsApp button message delivered to ${to}. Message ID: ${response.data?.messages?.[0]?.id}`);
+            return true;
+        }
+        catch (error) {
+            logger_1.logger.error(`Error sending WhatsApp button message to ${to}:`, error?.response?.data || error.message);
+            return false;
+        }
+    }
+    /**
+     * Send interactive list message (for more than 3 options) to WhatsApp recipient
+     */
+    async sendListMessage(to, bodyText, buttonText, sections) {
+        logger_1.logger.info(`Sending WhatsApp interactive list to ${to}: "${bodyText.substring(0, 50)}..."`);
+        if (this.token === 'mock_whatsapp_token' || this.phoneNumberId === 'mock_phone_number_id') {
+            logger_1.logger.info(`[MOCK WHATSAPP LIST SEND] To: ${to}\nText: ${bodyText}\nSections: ${JSON.stringify(sections)}`);
+            return true;
+        }
+        try {
+            const response = await axios_1.default.post(`${this.apiUrl}/messages`, {
+                messaging_product: 'whatsapp',
+                recipient_type: 'individual',
+                to,
+                type: 'interactive',
+                interactive: {
+                    type: 'list',
+                    body: { text: bodyText },
+                    action: {
+                        button: buttonText.substring(0, 20),
+                        sections,
+                    },
+                },
+            }, {
+                headers: {
+                    Authorization: `Bearer ${this.token}`,
+                    'Content-Type': 'application/json',
+                },
+                timeout: 10000,
+            });
+            logger_1.logger.info(`WhatsApp list message delivered to ${to}. Message ID: ${response.data?.messages?.[0]?.id}`);
+            return true;
+        }
+        catch (error) {
+            logger_1.logger.error(`Error sending WhatsApp list message to ${to}:`, error?.response?.data || error.message);
             return false;
         }
     }

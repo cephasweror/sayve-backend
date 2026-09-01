@@ -45,5 +45,9 @@ const UserSchema = new mongoose_1.Schema({
         default: 'AWAITING_BUSINESS_NAME',
     },
     lastTransactionId: { type: mongoose_1.Schema.Types.ObjectId, ref: 'Transaction' },
+    pendingClarification: {
+        type: mongoose_1.Schema.Types.Mixed,
+        default: null,
+    },
 }, { timestamps: true });
 exports.User = mongoose_1.default.model('User', UserSchema);
