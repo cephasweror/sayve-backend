@@ -3,7 +3,7 @@ import mongoose, { Schema, Document } from 'mongoose';
 export type OnboardingState = 'AWAITING_BUSINESS_NAME' | 'AWAITING_CURRENCY' | 'COMPLETED';
 
 export interface IPendingClarification {
-  type: 'transaction_type' | 'period' | 'business_name' | 'amount' | 'category';
+  type: 'transaction_type' | 'period' | 'business_name' | 'amount' | 'category' | 'export_format';
   partialData?: Record<string, any>;
   askedAt?: Date;
 }

@@ -50,6 +50,7 @@ export class WebhookController {
     // Meta requires 200 OK immediately to acknowledge receipt
     res.status(200).send('EVENT_RECEIVED');
 
+    let senderPhone = '';
     try {
       const body = req.body;
 
@@ -65,14 +66,24 @@ export class WebhookController {
         return;
       }
 
-      const senderPhone = message.from;
+      senderPhone = message.from || '';
       const messageType = message.type;
 
       logger.info(`Incoming WhatsApp message from ${senderPhone} (type: ${messageType})`);
 
       let incomingText = '';
+      let buttonId: string | null = null;
 
-      if (messageType === 'audio') {
+      if (messageType === 'interactive') {
+        const interactive = message.interactive;
+        if (interactive?.type === 'button_reply') {
+          buttonId = interactive.button_reply?.id || null;
+          incomingText = interactive.button_reply?.title || buttonId || '';
+        } else if (interactive?.type === 'list_reply') {
+          buttonId = interactive.list_reply?.id || null;
+          incomingText = interactive.list_reply?.title || buttonId || '';
+        }
+      } else if (messageType === 'audio') {
         // Voice Note Handler
         const audioMediaId: string = message.audio?.id;
         if (!audioMediaId) {
@@ -129,7 +140,7 @@ export class WebhookController {
         return;
       }
 
-      if (!incomingText.trim()) return;
+      if (!incomingText.trim() && !buttonId) return;
 
       // 1. Get or create user record
       const user = await onboardingService.getOrCreateUser(senderPhone);
@@ -147,18 +158,32 @@ export class WebhookController {
         return;
       }
 
-      // 4. Pending Clarification Loop Handling
-      if (user.pendingClarification) {
-        const intent = await pipelineService.classifyIntent(incomingText, user.pendingClarification);
+      // 4. DIRECT ROUTING FOR BUTTON REPLIES & PENDING CLARIFICATION
+      if (buttonId || user.pendingClarification) {
+        // Case A: Export Format Selection
+        if (buttonId === 'btn_fmt_csv' || buttonId === 'btn_fmt_excel' || buttonId === 'btn_fmt_pdf' || (user.pendingClarification?.type === 'export_format')) {
+          let fmt: 'excel' | 'pdf' | 'csv' = 'excel';
+          if (buttonId === 'btn_fmt_csv' || lowerText.includes('csv')) fmt = 'csv';
+          else if (buttonId === 'btn_fmt_pdf' || lowerText.includes('pdf')) fmt = 'pdf';
+          else if (buttonId === 'btn_fmt_excel' || lowerText.includes('excel')) fmt = 'excel';
 
-        if (intent === 'clarification_reply') {
-          const partial = user.pendingClarification.partialData || {};
-          const lower = incomingText.toLowerCase();
+          user.pendingClarification = null;
+          await user.save();
 
-          let type = partial.type;
-          if (!type) {
-            if (lower.includes('income') || lower.includes('sold') || lower.includes('in') || lower.includes('sale')) type = 'income';
-            else if (lower.includes('expense') || lower.includes('spent') || lower.includes('out') || lower.includes('buy')) type = 'expense';
+          await whatsappService.sendTextMessage(senderPhone, `⏳ Generating your transaction report (${fmt.toUpperCase()})...`);
+          await exportService.exportAndSendReport(user, fmt, '30 Days');
+          return;
+        }
+
+        // Case B: Income vs Expense Clarification
+        if (buttonId === 'btn_money_in' || buttonId === 'btn_money_out' || (user.pendingClarification?.type === 'transaction_type')) {
+          const partial = user.pendingClarification?.partialData || {};
+          let type: 'income' | 'expense' | null = partial.type || null;
+
+          if (buttonId === 'btn_money_in' || lowerText.includes('income') || lowerText.includes('money in') || lowerText.includes('sold') || lowerText.includes('sale') || lowerText.includes('in')) {
+            type = 'income';
+          } else if (buttonId === 'btn_money_out' || lowerText.includes('expense') || lowerText.includes('money out') || lowerText.includes('spent') || lowerText.includes('buy') || lowerText.includes('out')) {
+            type = 'expense';
           }
 
           let amount = partial.amount;
@@ -168,13 +193,57 @@ export class WebhookController {
           }
 
           if (type && amount) {
-            // Clarification resolved! Create transaction
             const tx = await Transaction.create({
               userId: user._id,
               phoneNumber: senderPhone,
               type,
               amount,
               category: partial.category || (type === 'income' ? 'Sales' : 'Other'),
+              description: partial.description || incomingText,
+              rawMessage: incomingText,
+              businessName: user.businessName,
+              date: new Date(),
+            });
+
+            user.pendingClarification = null;
+            user.lastTransactionId = tx._id as any;
+            await user.save();
+
+            const replyText = await replyService.generateLogReply(user, [tx]);
+            await whatsappService.sendTextMessage(senderPhone, replyText);
+            return;
+          }
+        }
+
+        // Case C: Report Period Selection
+        if (buttonId === 'btn_period_today' || buttonId === 'btn_period_week' || buttonId === 'btn_period_month' || (user.pendingClarification?.type === 'period')) {
+          let period: 'today' | 'week' | 'month' = 'month';
+          if (buttonId === 'btn_period_today' || lowerText.includes('today')) period = 'today';
+          else if (buttonId === 'btn_period_week' || lowerText.includes('week')) period = 'week';
+          else if (buttonId === 'btn_period_month' || lowerText.includes('month')) period = 'month';
+
+          user.pendingClarification = null;
+          await user.save();
+
+          const summaryText = await summaryService.getSummary(user, period);
+          await whatsappService.sendTextMessage(senderPhone, summaryText);
+          return;
+        }
+
+        // Case D: Category Confirmation Button
+        if (buttonId && buttonId.startsWith('btn_cat_')) {
+          const catName = buttonId.replace('btn_cat_', '');
+          const partial = user.pendingClarification?.partialData || {};
+          const type = partial.type || 'expense';
+          const amount = partial.amount || 0;
+
+          if (amount > 0) {
+            const tx = await Transaction.create({
+              userId: user._id,
+              phoneNumber: senderPhone,
+              type,
+              amount,
+              category: catName,
               description: partial.description || incomingText,
               rawMessage: incomingText,
               businessName: user.businessName,
@@ -212,7 +281,7 @@ export class WebhookController {
         return;
       }
 
-      // Route Option A: Needs Clarification (Set pending state in DB)
+      // Route Option A: Needs Clarification (Set pending state in DB & send interactive buttons if applicable)
       if (parsed.needs_clarification && parsed.clarification_question) {
         const item = parsed.items[0];
         user.pendingClarification = {
@@ -229,7 +298,16 @@ export class WebhookController {
 
         const humanQuestion = replyService.generateClarifyingQuestion(parsed.clarification_question);
         logger.info(`Saved pending clarification for ${senderPhone}. Question: "${humanQuestion}"`);
-        await whatsappService.sendTextMessage(senderPhone, `❓ ${humanQuestion}`);
+
+        // Send quick reply buttons for money in / money out if income/expense is ambiguous
+        if (humanQuestion.toLowerCase().includes('money in or money out')) {
+          await whatsappService.sendButtonMessage(senderPhone, `❓ ${humanQuestion}`, [
+            { id: 'btn_money_in', title: 'Money In' },
+            { id: 'btn_money_out', title: 'Money Out' },
+          ]);
+        } else {
+          await whatsappService.sendTextMessage(senderPhone, `❓ ${humanQuestion}`);
+        }
         return;
       }
 
@@ -267,11 +345,28 @@ export class WebhookController {
         return;
       }
 
-      // Route Option D: Export Report Request (Excel default, PDF or CSV if specified)
+      // Route Option D: Export Report Request (Excel default, PDF or CSV if specified, ask format via buttons if unspecified)
       if (parsed.isExportRequest) {
-        let format: 'excel' | 'pdf' | 'csv' = 'excel';
-        if (lowerText.includes('pdf')) format = 'pdf';
-        else if (lowerText.includes('csv')) format = 'csv';
+        let format = parsed.exportFormat || 'unspecified';
+
+        if (format === 'unspecified') {
+          user.pendingClarification = {
+            type: 'export_format',
+            askedAt: new Date(),
+          };
+          await user.save();
+
+          await whatsappService.sendButtonMessage(
+            senderPhone,
+            '📊 Which format would you like for your financial report?',
+            [
+              { id: 'btn_fmt_csv', title: 'CSV' },
+              { id: 'btn_fmt_excel', title: 'Excel' },
+              { id: 'btn_fmt_pdf', title: 'PDF' },
+            ]
+          );
+          return;
+        }
 
         await whatsappService.sendTextMessage(senderPhone, `⏳ Generating your transaction report (${format.toUpperCase()})...`);
         await exportService.exportAndSendReport(user, format, '30 Days');

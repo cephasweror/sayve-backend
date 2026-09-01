@@ -150,6 +150,34 @@ describe('Sayve Comprehensive Benchmark Test Suite', () => {
       expect(res).not.toBeNull();
       expect(res?.isSummaryQuery).toBe(true);
     });
+
+    it('should detect export format "excel" for "send my report as excel"', async () => {
+      const res = await parserService.parseUserMessage('send my report as excel');
+      expect(res).not.toBeNull();
+      expect(res?.isExportRequest).toBe(true);
+      expect(res?.exportFormat).toBe('excel');
+    });
+
+    it('should detect export format "csv" for "can I get a CSV"', async () => {
+      const res = await parserService.parseUserMessage('can I get a CSV');
+      expect(res).not.toBeNull();
+      expect(res?.isExportRequest).toBe(true);
+      expect(res?.exportFormat).toBe('csv');
+    });
+
+    it('should detect export format "pdf" for "pdf of this month\'s report"', async () => {
+      const res = await parserService.parseUserMessage('pdf of this month\'s report');
+      expect(res).not.toBeNull();
+      expect(res?.isExportRequest).toBe(true);
+      expect(res?.exportFormat).toBe('pdf');
+    });
+
+    it('should set exportFormat to "unspecified" for ambiguous "send my report"', async () => {
+      const res = await parserService.parseUserMessage('send my report');
+      expect(res).not.toBeNull();
+      expect(res?.isExportRequest).toBe(true);
+      expect(res?.exportFormat).toBe('unspecified');
+    });
   });
 
   describe('7. Clarification Replies', () => {

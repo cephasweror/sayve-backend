@@ -4,6 +4,8 @@ import { Request, Response } from 'express';
 jest.mock('../services/whatsapp.service', () => ({
   whatsappService: {
     sendTextMessage: jest.fn().mockResolvedValue(true),
+    sendButtonMessage: jest.fn().mockResolvedValue(true),
+    sendListMessage: jest.fn().mockResolvedValue(true),
     downloadAudioBuffer: jest.fn().mockResolvedValue(Buffer.from('mock_audio')),
     downloadImageBuffer: jest.fn().mockResolvedValue(Buffer.from('mock_image')),
     uploadMedia: jest.fn().mockResolvedValue('mock_media_id'),
@@ -237,6 +239,108 @@ describe('WebhookController', () => {
       expect(res.status).toHaveBeenCalledWith(200);
       const lastCall = whatsappService.sendTextMessage.mock.calls.at(-1);
       expect(lastCall[1]).toContain('Sayve Commands');
+    });
+
+    it('should parse button reply payload and route directly to export format handler', async () => {
+      const { exportService } = require('../services/export.service');
+      const req = {
+        body: buildMetaPayload({
+          from: '2348012345678',
+          type: 'interactive',
+          interactive: {
+            type: 'button_reply',
+            button_reply: { id: 'btn_fmt_csv', title: 'CSV' },
+          },
+        }),
+      } as unknown as Request;
+      const res = buildMockRes();
+
+      await webhookController.handleIncomingMessage(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(exportService.exportAndSendReport).toHaveBeenCalledWith(
+        expect.anything(),
+        'csv',
+        '30 Days'
+      );
+    });
+
+    it('should handle money in button reply payload directly without intent re-classification', async () => {
+      const { Transaction } = require('../models/Transaction');
+      const req = {
+        body: buildMetaPayload({
+          from: '2348012345678',
+          type: 'interactive',
+          interactive: {
+            type: 'button_reply',
+            button_reply: { id: 'btn_money_in', title: 'Money In' },
+          },
+        }),
+      } as unknown as Request;
+      const res = buildMockRes();
+
+      // Set user pending clarification state
+      const { onboardingService } = require('../services/onboarding.service');
+      onboardingService.getOrCreateUser.mockResolvedValueOnce({
+        _id: 'user_id_123',
+        phoneNumber: '2348012345678',
+        businessName: 'Test Shop',
+        currency: 'NGN',
+        onboardingState: 'COMPLETED',
+        pendingClarification: {
+          type: 'transaction_type',
+          partialData: { amount: 20000, description: 'rice and beans' },
+        },
+        save: jest.fn().mockResolvedValue(true),
+      });
+
+      await webhookController.handleIncomingMessage(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(Transaction.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'income',
+          amount: 20000,
+        })
+      );
+    });
+
+    it('should prompt user with interactive quick reply buttons when export format is unspecified', async () => {
+      const { parserService } = require('../services/parser.service');
+      const { whatsappService } = require('../services/whatsapp.service');
+
+      parserService.parseUserMessage.mockResolvedValueOnce({
+        needs_clarification: false,
+        clarification_question: null,
+        is_batch: false,
+        isSummaryQuery: false,
+        isExportRequest: true,
+        exportFormat: 'unspecified',
+        items: [],
+        rawText: 'send my report',
+      });
+
+      const req = {
+        body: buildMetaPayload({
+          from: '2348012345678',
+          type: 'text',
+          text: { body: 'send my report' },
+        }),
+      } as unknown as Request;
+      const res = buildMockRes();
+
+      await webhookController.handleIncomingMessage(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(whatsappService.sendButtonMessage).toHaveBeenCalledWith(
+        '2348012345678',
+        expect.stringContaining('Which format would you like'),
+        expect.arrayContaining([
+          { id: 'btn_fmt_csv', title: 'CSV' },
+          { id: 'btn_fmt_excel', title: 'Excel' },
+          { id: 'btn_fmt_pdf', title: 'PDF' },
+        ])
+      );
     });
   });
 });

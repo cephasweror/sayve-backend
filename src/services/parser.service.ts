@@ -22,6 +22,7 @@ export interface ParsedResponse {
   isSummaryQuery?: boolean;
   queryPeriod?: 'today' | 'week' | 'month';
   isExportRequest?: boolean;
+  exportFormat?: 'excel' | 'pdf' | 'csv' | 'unspecified';
   isCorrection?: boolean;
   correctedCategory?: string;
   rawText: string;
@@ -99,14 +100,28 @@ export class ParserService {
       }
 
       if (intent === 'report_request') {
-        const isExport = ['report', 'export', 'csv', 'excel', 'pdf', 'document'].some(k => lower.includes(k));
+        const isExplicitExport = ['export', 'csv', 'excel', 'xlsx', 'pdf', 'file', 'document', 'download'].some(k => lower.includes(k));
+        const asksForReport = lower.includes('send my report') || lower.includes('send report') || lower.includes('get report');
+
+        const isExportRequest = isExplicitExport || asksForReport;
+
+        let exportFormat: 'excel' | 'pdf' | 'csv' | 'unspecified' = 'unspecified';
+        if (lower.includes('excel') || lower.includes('xlsx')) {
+          exportFormat = 'excel';
+        } else if (lower.includes('pdf')) {
+          exportFormat = 'pdf';
+        } else if (lower.includes('csv')) {
+          exportFormat = 'csv';
+        }
+
         return {
           needs_clarification: false,
           clarification_question: null,
           is_batch: false,
           items: [],
-          isSummaryQuery: !isExport,
-          isExportRequest: isExport,
+          isSummaryQuery: !isExportRequest,
+          isExportRequest,
+          exportFormat,
           queryPeriod,
           rawText: userMessage,
         };

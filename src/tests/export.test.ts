@@ -98,7 +98,40 @@ describe('ExportService Unit Tests', () => {
     );
   });
 
-  it('should generate PDF and Excel buffers directly without crashing', async () => {
+  it('should generate CSV report when requested', async () => {
+    const mockTxs = [
+      {
+        date: new Date('2026-08-20'),
+        type: 'income',
+        category: 'Sales',
+        amount: 45000,
+        description: 'sold 3 bags of rice',
+        rawMessage: 'sold 3 bags of rice 45k',
+      },
+      {
+        date: new Date('2026-08-21'),
+        type: 'expense',
+        category: 'Fuel',
+        amount: 5000,
+        description: 'petrol for generator',
+        rawMessage: 'spent 5000 on fuel',
+      },
+    ];
+
+    (Transaction.find as jest.Mock).mockReturnValue({
+      sort: jest.fn().mockResolvedValue(mockTxs),
+    });
+
+    const result = await exportService.exportAndSendReport(mockUser as IUser, 'csv');
+    expect(result).toBe(true);
+    expect(whatsappService.uploadMedia).toHaveBeenCalledWith(
+      expect.any(Buffer),
+      'sayve_report_kemi_stores.csv',
+      'text/csv'
+    );
+  });
+
+  it('should generate PDF, Excel, and CSV buffers directly containing correct values without crashing', async () => {
     const mockTxs = [
       {
         date: new Date('2026-08-20'),
@@ -107,6 +140,14 @@ describe('ExportService Unit Tests', () => {
         amount: 45000,
         description: 'sold rice',
         rawMessage: 'sold rice 45k',
+      },
+      {
+        date: new Date('2026-08-21'),
+        type: 'expense',
+        category: 'Transport',
+        amount: 3000,
+        description: 'okada ride',
+        rawMessage: 'transport 3000',
       },
     ];
 
