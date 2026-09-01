@@ -208,9 +208,9 @@ describe('Sayve Comprehensive Benchmark Test Suite', () => {
       expect(res?.needs_clarification).toBe(true);
     });
 
-    it('should classify "Hello" as non-transaction / unclear without crashing', async () => {
+    it('should classify "Hello" as greeting intent without crashing', async () => {
       const intent = await pipelineService.classifyIntent('Hello');
-      expect(intent).toBe('unclear');
+      expect(intent).toBe('greeting');
     });
 
     it('should require clarification when amount is missing in "sold rice"', async () => {

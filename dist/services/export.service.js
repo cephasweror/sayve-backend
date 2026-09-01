@@ -149,20 +149,28 @@ class ExportService {
     /**
      * Export transactions as Excel (default), PDF, or CSV and deliver to user's WhatsApp
      */
-    async exportAndSendReport(user, format = 'excel', periodLabel = '30 Days') {
+    async exportAndSendReport(user, format = 'excel', periodLabel = '30 Days', startDate, endDate) {
         const phone = user.phoneNumber;
         const businessName = user.businessName || 'My Business';
-        logger_1.logger.info(`[Report Export] Step 1/4: Starting ${format.toUpperCase()} report export pipeline for user ${phone} (${businessName})`);
+        logger_1.logger.info(`[Report Export] Step 1/4: Starting ${format.toUpperCase()} report export pipeline for user ${phone} (${businessName}, ${periodLabel})`);
         try {
-            const thirtyDaysAgo = new Date();
-            thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-            const transactions = await Transaction_1.Transaction.find({
-                userId: user._id,
-                date: { $gte: thirtyDaysAgo },
-            }).sort({ date: -1 });
+            const dateFilter = { userId: user._id };
+            if (startDate || endDate) {
+                dateFilter.date = {};
+                if (startDate)
+                    dateFilter.date.$gte = startDate;
+                if (endDate)
+                    dateFilter.date.$lte = endDate;
+            }
+            else {
+                const thirtyDaysAgo = new Date();
+                thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+                dateFilter.date = { $gte: thirtyDaysAgo };
+            }
+            const transactions = await Transaction_1.Transaction.find(dateFilter).sort({ date: -1 });
             logger_1.logger.info(`[Report Export] Step 1/4: Retrieved ${transactions.length} transactions from DB for ${phone}`);
             if (transactions.length === 0) {
-                await whatsapp_service_1.whatsappService.sendTextMessage(phone, `ℹ️ No transactions recorded in the last 30 days to export for *${businessName}*.`);
+                await whatsapp_service_1.whatsappService.sendTextMessage(phone, `ℹ️ No transactions recorded for *${periodLabel}* to export for *${businessName}*.`);
                 return true;
             }
             let buffer;

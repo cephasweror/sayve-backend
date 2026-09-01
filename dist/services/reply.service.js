@@ -113,6 +113,27 @@ Write a short 1-2 line WhatsApp confirmation reply. Include context if count > 1
         }
         return questionStr;
     }
+    /**
+     * Generate warm, intelligent greeting response for returning users
+     */
+    generateGreetingReply(user) {
+        const businessName = user.businessName || 'friend';
+        const hour = new Date().getHours();
+        let timeGreeting = 'Hello';
+        if (hour >= 4 && hour < 12)
+            timeGreeting = 'Good morning';
+        else if (hour >= 12 && hour < 17)
+            timeGreeting = 'Good afternoon';
+        else if (hour >= 17 && hour < 22)
+            timeGreeting = 'Good evening';
+        const greetings = [
+            `${timeGreeting}, *${businessName}*! ☀️ How's business today? What transactions are we logging?`,
+            `Welcome back to *${businessName}*! 👋 Ready to track today's sales and expenses?`,
+            `Hey there, *${businessName}*! 🚀 Ready for a productive day? Send me any sales or expenses as you go.`,
+            `${timeGreeting}! 📊 What are we recording for *${businessName}* today?`,
+        ];
+        return greetings[Math.floor(Math.random() * greetings.length)];
+    }
 }
 exports.ReplyService = ReplyService;
 exports.replyService = new ReplyService();

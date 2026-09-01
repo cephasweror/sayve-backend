@@ -174,27 +174,34 @@ export class ExportService {
   async exportAndSendReport(
     user: IUser,
     format: 'excel' | 'pdf' | 'csv' = 'excel',
-    periodLabel: string = '30 Days'
+    periodLabel: string = '30 Days',
+    startDate?: Date,
+    endDate?: Date
   ): Promise<boolean> {
     const phone = user.phoneNumber;
     const businessName = user.businessName || 'My Business';
-    logger.info(`[Report Export] Step 1/4: Starting ${format.toUpperCase()} report export pipeline for user ${phone} (${businessName})`);
+    logger.info(`[Report Export] Step 1/4: Starting ${format.toUpperCase()} report export pipeline for user ${phone} (${businessName}, ${periodLabel})`);
 
     try {
-      const thirtyDaysAgo = new Date();
-      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+      const dateFilter: any = { userId: user._id };
+      if (startDate || endDate) {
+        dateFilter.date = {};
+        if (startDate) dateFilter.date.$gte = startDate;
+        if (endDate) dateFilter.date.$lte = endDate;
+      } else {
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+        dateFilter.date = { $gte: thirtyDaysAgo };
+      }
 
-      const transactions: ITransaction[] = await Transaction.find({
-        userId: user._id,
-        date: { $gte: thirtyDaysAgo },
-      }).sort({ date: -1 });
+      const transactions: ITransaction[] = await Transaction.find(dateFilter).sort({ date: -1 });
 
       logger.info(`[Report Export] Step 1/4: Retrieved ${transactions.length} transactions from DB for ${phone}`);
 
       if (transactions.length === 0) {
         await whatsappService.sendTextMessage(
           phone,
-          `ℹ️ No transactions recorded in the last 30 days to export for *${businessName}*.`
+          `ℹ️ No transactions recorded for *${periodLabel}* to export for *${businessName}*.`
         );
         return true;
       }

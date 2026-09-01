@@ -7,16 +7,25 @@ export class SummaryService {
   /**
    * Calculate summary totals for a given time period
    */
-  async getSummary(user: IUser, period: 'today' | 'week' | 'month' = 'month'): Promise<string> {
+  async getSummary(
+    user: IUser,
+    period: 'today' | 'week' | 'month' | 'quarter' | 'year' | 'all' | 'custom' = 'month',
+    startDateParam?: Date,
+    endDateParam?: Date,
+    customLabel?: string
+  ): Promise<string> {
     try {
-      // Calculate date boundaries adjusted for WAT (West Africa Time, UTC+1)
       const WAT_OFFSET = 1 * 60 * 60 * 1000;
-      const now = new Date();
+      const now = endDateParam || new Date();
       const watNow = new Date(now.getTime() + WAT_OFFSET);
 
       let startDate: Date;
+      let periodLabel = customLabel || 'This Month';
 
-      if (period === 'today') {
+      if (startDateParam) {
+        startDate = startDateParam;
+        if (!customLabel) periodLabel = 'Custom Period';
+      } else if (period === 'today') {
         const watTodayMidnight = new Date(Date.UTC(
           watNow.getUTCFullYear(),
           watNow.getUTCMonth(),
@@ -24,6 +33,7 @@ export class SummaryService {
           0, 0, 0, 0
         ));
         startDate = new Date(watTodayMidnight.getTime() - WAT_OFFSET);
+        periodLabel = 'Today';
       } else if (period === 'week') {
         const dayOfWeek = watNow.getUTCDay();
         const distanceToMonday = (dayOfWeek + 6) % 7;
@@ -34,6 +44,18 @@ export class SummaryService {
           0, 0, 0, 0
         ));
         startDate = new Date(watMondayMidnight.getTime() - WAT_OFFSET);
+        periodLabel = 'This Week';
+      } else if (period === 'quarter') {
+        const currentYear = watNow.getUTCFullYear();
+        const quarter = Math.floor(watNow.getUTCMonth() / 3);
+        startDate = new Date(currentYear, quarter * 3, 1);
+        periodLabel = `Q${quarter + 1} ${currentYear}`;
+      } else if (period === 'year') {
+        startDate = new Date(watNow.getUTCFullYear(), 0, 1);
+        periodLabel = `${watNow.getUTCFullYear()} Full Year`;
+      } else if (period === 'all') {
+        startDate = new Date(2020, 0, 1);
+        periodLabel = 'All Time';
       } else {
         // month
         const watMonthFirstMidnight = new Date(Date.UTC(
@@ -43,6 +65,7 @@ export class SummaryService {
           0, 0, 0, 0
         ));
         startDate = new Date(watMonthFirstMidnight.getTime() - WAT_OFFSET);
+        periodLabel = 'This Month';
       }
 
       const transactions: ITransaction[] = await Transaction.find({
@@ -65,7 +88,6 @@ export class SummaryService {
       }
 
       const netProfit = totalIncome - totalExpenses;
-      const periodLabel = period === 'today' ? 'Today' : period === 'week' ? 'This Week' : 'This Month';
       const currency = user.currency || 'NGN';
       const profitStatus = netProfit >= 0 ? '📈 *Net Profit:*' : '⚠️ *Net Deficit:*';
 

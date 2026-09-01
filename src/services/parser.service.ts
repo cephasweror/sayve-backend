@@ -19,8 +19,18 @@ export interface ParsedResponse {
   items: ParsedItem[];
 
   // Non-transaction intents
+  isGreeting?: boolean;
+  isSettingsChange?: boolean;
+  settingsType?: 'currency' | 'business_name';
+  newSettingValue?: string;
+  isDeleteLastTx?: boolean;
+
   isSummaryQuery?: boolean;
-  queryPeriod?: 'today' | 'week' | 'month';
+  queryPeriod?: 'today' | 'week' | 'month' | 'quarter' | 'year' | 'all' | 'custom';
+  startDate?: Date;
+  endDate?: Date;
+  periodLabel?: string;
+
   isExportRequest?: boolean;
   exportFormat?: 'excel' | 'pdf' | 'csv' | 'unspecified';
   isCorrection?: boolean;
@@ -76,6 +86,68 @@ export function normalizeNigerianMarketNumbers(text: string): string {
     });
 }
 
+/**
+ * Parse date ranges like "August to October", "Nov 6 to Oct 12", "this quarter", "this year"
+ */
+export function parseDateRange(lower: string): { startDate?: Date; endDate?: Date; label: string; period: 'today' | 'week' | 'month' | 'quarter' | 'year' | 'all' | 'custom' } {
+  const now = new Date();
+  const currentYear = now.getFullYear();
+
+  if (lower.includes('today')) {
+    const start = new Date(now.setHours(0, 0, 0, 0));
+    return { startDate: start, endDate: new Date(), label: 'Today', period: 'today' };
+  }
+  if (lower.includes('this week') || lower.includes('week')) {
+    const day = now.getDay();
+    const diffToMonday = (day + 6) % 7;
+    const start = new Date(now);
+    start.setDate(now.getDate() - diffToMonday);
+    start.setHours(0, 0, 0, 0);
+    return { startDate: start, endDate: new Date(), label: 'This Week', period: 'week' };
+  }
+  if (lower.includes('this quarter') || lower.includes('quarter')) {
+    const quarter = Math.floor(now.getMonth() / 3);
+    const start = new Date(currentYear, quarter * 3, 1);
+    return { startDate: start, endDate: new Date(), label: `Q${quarter + 1} ${currentYear}`, period: 'quarter' };
+  }
+  if (lower.includes('this year') || lower.includes('year') || lower.includes('yearly')) {
+    const start = new Date(currentYear, 0, 1);
+    return { startDate: start, endDate: new Date(), label: `${currentYear} Full Year`, period: 'year' };
+  }
+  if (lower.includes('all time') || lower.includes('all-time') || lower.includes('everything')) {
+    return { startDate: new Date(2020, 0, 1), endDate: new Date(), label: 'All Time', period: 'all' };
+  }
+
+  // Month name range detection (e.g. "august to october", "nov to dec")
+  const months = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+  const monthAbbrs = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+
+  let startMonthIdx = -1;
+  let endMonthIdx = -1;
+
+  for (let i = 0; i < 12; i++) {
+    if (lower.includes(months[i]) || new RegExp(`\\b${monthAbbrs[i]}\\b`).test(lower)) {
+      if (startMonthIdx === -1) startMonthIdx = i;
+      else endMonthIdx = i;
+    }
+  }
+
+  if (startMonthIdx !== -1) {
+    if (endMonthIdx === -1) endMonthIdx = startMonthIdx;
+    const startDate = new Date(currentYear, startMonthIdx, 1);
+    const endDate = new Date(currentYear, endMonthIdx + 1, 0, 23, 59, 59);
+    const monthLabel = startMonthIdx === endMonthIdx
+      ? months[startMonthIdx].toUpperCase()
+      : `${months[startMonthIdx].toUpperCase()} – ${months[endMonthIdx].toUpperCase()}`;
+    return { startDate, endDate, label: monthLabel, period: 'custom' };
+  }
+
+  // Default to Month
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  return { startDate: thirtyDaysAgo, endDate: new Date(), label: '30 Days', period: 'month' };
+}
+
 export class ParserService {
   /**
    * Parse user text message into structured intent & transaction data using 2-stage pipeline
@@ -89,15 +161,63 @@ export class ParserService {
 
       // STAGE 1: Intent Classification
       const intent = await pipelineService.classifyIntent(userMessage, pendingClarification);
-
-      // Determine period helper
-      let queryPeriod: 'today' | 'week' | 'month' = 'month';
       const lower = userMessage.toLowerCase();
-      if (lower.includes('today') || lower.includes('for today') || lower.includes("today's")) {
-        queryPeriod = 'today';
-      } else if (lower.includes('week') || lower.includes('this week')) {
-        queryPeriod = 'week';
+
+      if (intent === 'greeting') {
+        return {
+          needs_clarification: false,
+          clarification_question: null,
+          is_batch: false,
+          items: [],
+          isGreeting: true,
+          rawText: userMessage,
+        };
       }
+
+      if (intent === 'deletion') {
+        return {
+          needs_clarification: false,
+          clarification_question: null,
+          is_batch: false,
+          items: [],
+          isDeleteLastTx: true,
+          rawText: userMessage,
+        };
+      }
+
+      if (intent === 'settings') {
+        let settingsType: 'currency' | 'business_name' = 'currency';
+        let newSettingValue = '';
+
+        if (lower.includes('currency')) {
+          settingsType = 'currency';
+          if (lower.includes('usd') || lower.includes('dollar')) newSettingValue = 'USD';
+          else if (lower.includes('eur') || lower.includes('euro')) newSettingValue = 'EUR';
+          else if (lower.includes('gbp') || lower.includes('pound')) newSettingValue = 'GBP';
+          else if (lower.includes('ngn') || lower.includes('naira')) newSettingValue = 'NGN';
+          else {
+            const match = userMessage.match(/currency\s+(?:to\s+)?([A-Z]{3}|\$|₦|€|£)/i);
+            newSettingValue = match ? match[1].toUpperCase() : '';
+          }
+        } else if (lower.includes('business name') || lower.includes('business')) {
+          settingsType = 'business_name';
+          const match = userMessage.match(/(?:business name|business)\s+(?:to\s+)?(.+)/i);
+          newSettingValue = match ? match[1].trim() : '';
+        }
+
+        return {
+          needs_clarification: false,
+          clarification_question: null,
+          is_batch: false,
+          items: [],
+          isSettingsChange: true,
+          settingsType,
+          newSettingValue,
+          rawText: userMessage,
+        };
+      }
+
+      const dateRange = parseDateRange(lower);
 
       if (intent === 'report_request') {
         const isExplicitExport = ['export', 'csv', 'excel', 'xlsx', 'pdf', 'file', 'document', 'download'].some(k => lower.includes(k));
@@ -122,7 +242,10 @@ export class ParserService {
           isSummaryQuery: !isExportRequest,
           isExportRequest,
           exportFormat,
-          queryPeriod,
+          queryPeriod: dateRange.period,
+          startDate: dateRange.startDate,
+          endDate: dateRange.endDate,
+          periodLabel: dateRange.label,
           rawText: userMessage,
         };
       }

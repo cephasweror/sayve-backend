@@ -230,6 +230,33 @@ export class WebhookController {
           return;
         }
 
+        // Case E: Currency Change Button Reply
+        if (buttonId === 'btn_curr_ngn' || buttonId === 'btn_curr_usd' || buttonId === 'btn_curr_eur' || user.pendingClarification?.type === 'currency_change') {
+          let newCurr = 'NGN';
+          if (buttonId === 'btn_curr_usd' || lowerText.includes('usd') || lowerText.includes('dollar')) newCurr = 'USD';
+          else if (buttonId === 'btn_curr_eur' || lowerText.includes('eur') || lowerText.includes('euro')) newCurr = 'EUR';
+          else if (buttonId === 'btn_curr_ngn' || lowerText.includes('ngn') || lowerText.includes('naira')) newCurr = 'NGN';
+          else if (incomingText.trim()) newCurr = incomingText.trim().toUpperCase();
+
+          user.currency = newCurr;
+          user.pendingClarification = null;
+          await user.save();
+
+          await whatsappService.sendTextMessage(senderPhone, `⚙️ Currency updated to *${user.currency}* ✅`);
+          return;
+        }
+
+        // Case F: Business Name Change Reply
+        if (user.pendingClarification?.type === 'business_name_change') {
+          if (incomingText.trim()) {
+            user.businessName = incomingText.trim();
+            user.pendingClarification = null;
+            await user.save();
+            await whatsappService.sendTextMessage(senderPhone, `⚙️ Business name updated to *${user.businessName}* ✅`);
+            return;
+          }
+        }
+
         // Case D: Category Confirmation Button
         if (buttonId && buttonId.startsWith('btn_cat_')) {
           const catName = buttonId.replace('btn_cat_', '');
@@ -279,6 +306,66 @@ export class WebhookController {
           '🤔 I could not understand that. Try: *"sold 3 bags of rice for 45000"*, *"spent 5000 on transport"*, or type *"help"*.'
         );
         return;
+      }
+
+      // Route Option 0: Greeting Handler
+      if (parsed.isGreeting) {
+        const greetingMsg = replyService.generateGreetingReply(user);
+        await whatsappService.sendTextMessage(senderPhone, greetingMsg);
+        return;
+      }
+
+      // Route Option 00: Transaction Deletion / Undo Handler
+      if (parsed.isDeleteLastTx) {
+        if (!user.lastTransactionId) {
+          await whatsappService.sendTextMessage(senderPhone, '⚠️ No recent transaction found to delete.');
+          return;
+        }
+
+        const lastTx = await Transaction.findByIdAndDelete(user.lastTransactionId);
+        user.lastTransactionId = undefined;
+        await user.save();
+
+        if (lastTx) {
+          await whatsappService.sendTextMessage(
+            senderPhone,
+            `🗑️ Deleted: *${lastTx.description}* (${formatCurrency(lastTx.amount, user.currency || 'NGN')}) ✅`
+          );
+        } else {
+          await whatsappService.sendTextMessage(senderPhone, '⚠️ No recent transaction found to delete.');
+        }
+        return;
+      }
+
+      // Route Option 000: Settings Management Handler
+      if (parsed.isSettingsChange) {
+        if (parsed.settingsType === 'currency') {
+          if (parsed.newSettingValue) {
+            user.currency = parsed.newSettingValue;
+            await user.save();
+            await whatsappService.sendTextMessage(senderPhone, `⚙️ Currency updated to *${user.currency}* ✅`);
+          } else {
+            user.pendingClarification = { type: 'currency_change', askedAt: new Date() };
+            await user.save();
+            await whatsappService.sendButtonMessage(senderPhone, '⚙️ Which currency would you like to set?', [
+              { id: 'btn_curr_ngn', title: 'NGN (₦)' },
+              { id: 'btn_curr_usd', title: 'USD ($)' },
+              { id: 'btn_curr_eur', title: 'EUR (€)' },
+            ]);
+          }
+          return;
+        } else if (parsed.settingsType === 'business_name') {
+          if (parsed.newSettingValue) {
+            user.businessName = parsed.newSettingValue;
+            await user.save();
+            await whatsappService.sendTextMessage(senderPhone, `⚙️ Business name updated to *${user.businessName}* ✅`);
+          } else {
+            user.pendingClarification = { type: 'business_name_change', askedAt: new Date() };
+            await user.save();
+            await whatsappService.sendTextMessage(senderPhone, '⚙️ What is your new business name?');
+          }
+          return;
+        }
       }
 
       // Route Option A: Needs Clarification (Set pending state in DB & send interactive buttons if applicable)
@@ -340,7 +427,13 @@ export class WebhookController {
 
       // Route Option C: Financial Summary Query
       if (parsed.isSummaryQuery) {
-        const summaryText = await summaryService.getSummary(user, parsed.queryPeriod);
+        const summaryText = await summaryService.getSummary(
+          user,
+          parsed.queryPeriod,
+          parsed.startDate,
+          parsed.endDate,
+          parsed.periodLabel
+        );
         await whatsappService.sendTextMessage(senderPhone, summaryText);
         return;
       }
@@ -368,8 +461,9 @@ export class WebhookController {
           return;
         }
 
-        await whatsappService.sendTextMessage(senderPhone, `⏳ Generating your transaction report (${format.toUpperCase()})...`);
-        await exportService.exportAndSendReport(user, format, '30 Days');
+        const periodLabel = parsed.periodLabel || '30 Days';
+        await whatsappService.sendTextMessage(senderPhone, `⏳ Generating your transaction report (${format.toUpperCase()}, ${periodLabel})...`);
+        await exportService.exportAndSendReport(user, format, periodLabel, parsed.startDate, parsed.endDate);
         return;
       }
 

@@ -14,6 +14,9 @@ export type IntentCategory =
   | 'correction'
   | 'report_request'
   | 'clarification_reply'
+  | 'greeting'
+  | 'settings'
+  | 'deletion'
   | 'unclear';
 
 export interface ExtractedTransaction {
@@ -210,9 +213,12 @@ export class PipelineService {
     const systemPrompt = `You are an intent classifier for a WhatsApp financial assistant. Given a user's message, classify it into exactly one of these categories. Reply with ONLY the category name, nothing else.
 
 Categories:
+- greeting: friendly conversational openers or greetings with no transaction numbers (e.g. "hello", "hi", "good morning", "good evening", "how far", "hey", "what are we doing today").
+- settings: user wants to update their currency, business name, or account settings (e.g. "change currency to USD", "set currency", "change business name to X").
+- deletion: user wants to delete or undo their previous transaction (e.g. "delete last transaction", "undo", "remove last item", "delete entry").
 - new_transaction: describes money coming in or going out (a sale, a purchase, an expense, income of any kind), even if worded informally or with typos.
 - correction: the user is correcting, disputing, or amending their previous message (e.g. "no that's wrong", "I meant 15000 not 5000", "actually it was an expense").
-- report_request: the user wants a summary, total, breakdown, or report of their finances over any time period, however phrased ("how much did I make", "what's my report", "send my summary", "show me this week").
+- report_request: the user wants a summary, total, breakdown, or report of their finances over any time period, however phrased ("how much did I make", "what's my report", "send my summary", "show me this week", "export excel").
 - clarification_reply: a short reply that only makes sense as an answer to a question the assistant just asked (e.g. a bare number, "yes", "expense", "this week") — you will be told if a question is pending.
 - unclear: none of the above fit, or the message has no financial content.
 
@@ -296,9 +302,12 @@ A pending question context may be provided. If present, strongly favor classifyi
 
   private normalizeIntentLabel(raw: string): IntentCategory | null {
     const cleaned = raw.replace(/[^a-z_]/g, '');
-    if (['new_transaction', 'correction', 'report_request', 'clarification_reply', 'unclear'].includes(cleaned)) {
+    if (['new_transaction', 'correction', 'report_request', 'clarification_reply', 'greeting', 'settings', 'deletion', 'unclear'].includes(cleaned)) {
       return cleaned as IntentCategory;
     }
+    if (cleaned.includes('greeting') || cleaned.includes('hello')) return 'greeting';
+    if (cleaned.includes('setting') || cleaned.includes('currency')) return 'settings';
+    if (cleaned.includes('delete') || cleaned.includes('undo') || cleaned.includes('remove')) return 'deletion';
     if (cleaned.includes('transaction')) return 'new_transaction';
     if (cleaned.includes('correction')) return 'correction';
     if (cleaned.includes('report') || cleaned.includes('summary')) return 'report_request';
@@ -319,6 +328,32 @@ A pending question context may be provided. If present, strongly favor classifyi
       if (!startsFullNewTx) {
         return 'clarification_reply';
       }
+    }
+
+    if (
+      lower.startsWith('delete') ||
+      lower.includes('delete last') ||
+      lower.includes('undo last') ||
+      lower.includes('remove last') ||
+      lower === 'undo'
+    ) {
+      return 'deletion';
+    }
+
+    if (
+      lower.includes('change currency') ||
+      lower.includes('set currency') ||
+      lower.includes('update currency') ||
+      lower.includes('change business name') ||
+      lower.includes('set business name') ||
+      lower === 'settings'
+    ) {
+      return 'settings';
+    }
+
+    const greetingWords = ['hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening', 'how far', 'whats up', 'what up'];
+    if (greetingWords.some(g => lower === g || lower.startsWith(`${g} `) || lower.startsWith(`${g},`))) {
+      return 'greeting';
     }
 
     if (
