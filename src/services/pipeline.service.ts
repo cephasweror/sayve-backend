@@ -1,10 +1,13 @@
 import { Groq } from 'groq-sdk';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import axios from 'axios';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import { normalizeNigerianMarketNumbers } from './parser.service';
 import { IPendingClarification } from '../models/User';
 import { ITransaction } from '../models/Transaction';
+
+export type AIProvider = 'gemini' | 'groq' | 'openrouter' | 'heuristic';
 
 export type IntentCategory =
   | 'new_transaction'
@@ -21,6 +24,7 @@ export interface ExtractedTransaction {
   needsClarification: boolean;
   clarificationQuestion: string | null;
   date?: string;
+  provider?: AIProvider;
 }
 
 export interface CorrectionDiff {
@@ -28,6 +32,7 @@ export interface CorrectionDiff {
   type?: 'income' | 'expense' | 'gain' | 'loss';
   category?: string;
   description?: string;
+  provider?: AIProvider;
 }
 
 export interface ReportParams {
@@ -35,21 +40,160 @@ export interface ReportParams {
   format: 'excel' | 'pdf' | 'csv';
 }
 
+export interface GroqErrorAnalysis {
+  status: number | undefined;
+  isConfigError: boolean;
+  isTransientError: boolean;
+  message: string;
+}
+
+export function analyzeGroqError(err: any, modelName: string): GroqErrorAnalysis {
+  const status = err?.status || err?.statusCode || (err?.response ? err.response.status : undefined);
+  const rawMsg = err?.error?.message || err?.message || String(err);
+
+  if (status === 401 || rawMsg.includes('invalid_api_key') || rawMsg.includes('Unauthorized')) {
+    logger.error(`[AI] Groq authentication failed (401). Check GROQ_API_KEY. (${rawMsg})`);
+    return { status: 401, isConfigError: true, isTransientError: false, message: rawMsg };
+  }
+
+  if (status === 403) {
+    logger.error(`[AI] Groq access forbidden (403) for model "${modelName}". (${rawMsg})`);
+    return { status: 403, isConfigError: true, isTransientError: false, message: rawMsg };
+  }
+
+  if (status === 404 || rawMsg.includes('model_not_found')) {
+    logger.error(`[AI] Groq model not found (404) for model "${modelName}". Check GROQ_MODEL configuration. (${rawMsg})`);
+    return { status: 404, isConfigError: true, isTransientError: false, message: rawMsg };
+  }
+
+  if (status === 429 || rawMsg.includes('rate_limit_exceeded')) {
+    logger.warn(`[AI] Groq rate limited (429) for model "${modelName}". Falling back to OpenRouter.`);
+    return { status: 429, isConfigError: false, isTransientError: true, message: rawMsg };
+  }
+
+  if (status && status >= 500) {
+    logger.warn(`[AI] Groq server error (${status}) for model "${modelName}". Falling back to OpenRouter.`);
+    return { status, isConfigError: false, isTransientError: true, message: rawMsg };
+  }
+
+  logger.warn(`[AI] Groq request failed for model "${modelName}": ${rawMsg}`);
+  return { status, isConfigError: false, isTransientError: true, message: rawMsg };
+}
+
 export class PipelineService {
-  private groqClient: Groq | null = null;
   private geminiClient: GoogleGenerativeAI | null = null;
+  private groqClient: Groq | null = null;
 
   constructor() {
-    if (env.GROQ_API_KEY && env.GROQ_API_KEY !== 'mock_groq_key' && !env.GROQ_API_KEY.includes('your_') && env.GROQ_API_KEY.length > 10) {
-      this.groqClient = new Groq({ apiKey: env.GROQ_API_KEY });
+    this.initProviders();
+  }
+
+  private initProviders(): void {
+    const rawGeminiKey = process.env.GEMINI_API_KEY || env.GEMINI_API_KEY;
+    const rawGroqKey = process.env.GROQ_API_KEY || env.GROQ_API_KEY;
+    const rawOpenRouterKey = process.env.OPENROUTER_API_KEY || env.OPENROUTER_API_KEY;
+
+    const isGeminiConfigured = Boolean(rawGeminiKey && rawGeminiKey !== 'mock_gemini_key' && !rawGeminiKey.includes('your_') && rawGeminiKey.length > 10);
+    const isGroqConfigured = Boolean(rawGroqKey && rawGroqKey !== 'mock_groq_key' && !rawGroqKey.includes('your_') && rawGroqKey.length > 10);
+    const isOpenRouterConfigured = Boolean(rawOpenRouterKey && rawOpenRouterKey !== 'mock_openrouter_key' && !rawOpenRouterKey.includes('your_') && rawOpenRouterKey.length > 10);
+
+    // Diagnostic Startup Logs (Gemini Primary -> Groq Fallback -> OpenRouter Tertiary)
+    logger.info(`[AI] Gemini (Primary) configured: ${isGeminiConfigured} ${isGeminiConfigured ? `(Length: ${rawGeminiKey!.length}, Prefix: "${rawGeminiKey!.substring(0, 4)}***")` : ''}`);
+    logger.info(`[AI] Groq (Secondary Fallback) configured: ${isGroqConfigured} ${isGroqConfigured ? `(Length: ${rawGroqKey!.length}, Prefix: "${rawGroqKey!.substring(0, 4)}***")` : ''}`);
+    logger.info(`[AI] OpenRouter (Tertiary Fallback) configured: ${isOpenRouterConfigured} ${isOpenRouterConfigured ? `(Length: ${rawOpenRouterKey!.length}, Prefix: "${rawOpenRouterKey!.substring(0, 4)}***")` : ''}`);
+
+    if (isGeminiConfigured) {
+      this.geminiClient = new GoogleGenerativeAI(rawGeminiKey!);
     }
-    if (env.GEMINI_API_KEY && env.GEMINI_API_KEY !== 'mock_gemini_key' && !env.GEMINI_API_KEY.includes('your_') && env.GEMINI_API_KEY.length > 10) {
-      this.geminiClient = new GoogleGenerativeAI(env.GEMINI_API_KEY);
+    if (isGroqConfigured) {
+      this.groqClient = new Groq({ apiKey: rawGroqKey });
     }
   }
 
+  private getGeminiModelName(): string {
+    return process.env.GEMINI_MODEL || env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+  }
+
+  private getGroqCandidateModels(): string[] {
+    const primary = process.env.GROQ_MODEL || env.GROQ_MODEL || 'groq/compound';
+    const fallbackList = ['groq/compound', 'groq/compound-mini', 'qwen/qwen3.6-27b', 'llama-3.1-8b-instant', 'llama-3.3-70b-versatile'];
+    return Array.from(new Set([primary, ...fallbackList]));
+  }
+
+  private getOpenRouterCandidateModels(): string[] {
+    const primary = process.env.OPENROUTER_MODEL || env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free';
+    const fallbackList = ['meta-llama/llama-3.3-70b-instruct:free', 'google/gemini-2.0-flash-lite-001:free', 'openrouter/auto'];
+    return Array.from(new Set([primary, ...fallbackList]));
+  }
+
+  /**
+   * OpenRouter HTTP Integration (Tertiary Fallback)
+   */
+  private async callOpenRouter(systemPrompt: string, userPrompt: string, isJson: boolean = false): Promise<string | null> {
+    const apiKey = process.env.OPENROUTER_API_KEY || env.OPENROUTER_API_KEY;
+    if (!apiKey || apiKey === 'mock_openrouter_key' || apiKey.includes('your_') || apiKey.length < 10) {
+      return null;
+    }
+
+    const candidateModels = this.getOpenRouterCandidateModels();
+
+    for (const model of candidateModels) {
+      try {
+        const payload: any = {
+          model,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          temperature: 0.1,
+        };
+
+        if (isJson) {
+          payload.response_format = { type: 'json_object' };
+        }
+
+        const response = await axios.post(
+          'https://openrouter.ai/api/v1/chat/completions',
+          payload,
+          {
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              'HTTP-Referer': 'https://sayve.app',
+              'X-Title': 'Sayve WhatsApp Expense Tracker',
+              'Content-Type': 'application/json',
+            },
+            timeout: 12000,
+          }
+        );
+
+        const content = response.data?.choices?.[0]?.message?.content;
+        if (content) {
+          logger.info(`[AI] OpenRouter (${model}) succeeded`);
+          return content;
+        }
+      } catch (err: any) {
+        const status = err.response?.status;
+        const rawMsg = err.response?.data?.error?.message || err.message;
+
+        if (status === 401) {
+          logger.error(`[AI] OpenRouter authentication failed (401). Check OPENROUTER_API_KEY. (${rawMsg})`);
+          break;
+        } else if (status === 403) {
+          logger.error(`[AI] OpenRouter access forbidden (403) for model "${model}". (${rawMsg})`);
+        } else if (status === 404) {
+          logger.error(`[AI] OpenRouter model not found (404) for model "${model}". Check OPENROUTER_MODEL. (${rawMsg})`);
+        } else if (status === 429) {
+          logger.warn(`[AI] OpenRouter rate limited (429) for model "${model}". (${rawMsg})`);
+        } else {
+          logger.warn(`[AI] OpenRouter call failed for model "${model}": ${rawMsg}`);
+        }
+      }
+    }
+    return null;
+  }
+
   // ─────────────────────────────────────────────────────────────
-  // STAGE 1: INTENT CLASSIFIER
+  // STAGE 1: INTENT CLASSIFIER (Gemini Primary -> Groq Secondary -> OpenRouter Tertiary -> Heuristic)
   // ─────────────────────────────────────────────────────────────
   async classifyIntent(
     rawMessage: string,
@@ -57,8 +201,6 @@ export class PipelineService {
   ): Promise<IntentCategory> {
     const text = normalizeNigerianMarketNumbers(rawMessage).trim();
     const lower = text.toLowerCase();
-
-    // Fast-path heuristic fallback check for offline / unit test reliability
     const heuristicIntent = this.heuristicClassifyIntent(lower, pendingClarification);
 
     const pendingContextStr = pendingClarification
@@ -78,44 +220,77 @@ Pending Question Context: ${pendingContextStr}
 A pending question context may be provided. If present, strongly favor classifying as clarification_reply unless the message clearly starts a new, unrelated transaction.`;
 
     const userPrompt = `Message: "${text}"`;
+    let isGeminiConfigError = false;
 
-    if (this.groqClient) {
-      try {
-        const completion = await this.groqClient.chat.completions.create({
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
-          model: 'llama-3.3-70b-versatile',
-          temperature: 0.0,
-        });
-        const raw = completion.choices[0]?.message?.content?.trim().toLowerCase() || '';
-        const intent = this.normalizeIntentLabel(raw);
-        if (intent) {
-          logger.info(`[Stage 1 Intent Classifier] Groq classified "${text}" as "${intent}"`);
-          return intent;
-        }
-      } catch (err: any) {
-        logger.warn(`Stage 1 Groq classification failed: ${err.message}`);
-      }
-    }
-
+    // 1. Gemini (PRIMARY PROVIDER)
     if (this.geminiClient) {
+      const geminiModel = this.getGeminiModelName();
+      logger.info(`[AI] Trying Gemini Primary (${geminiModel})...`);
       try {
-        const model = this.geminiClient.getGenerativeModel({ model: 'gemini-1.5-flash' });
+        const model = this.geminiClient.getGenerativeModel({ model: geminiModel });
         const response = await model.generateContent(`${systemPrompt}\n\n${userPrompt}`);
         const raw = response.response.text().trim().toLowerCase();
         const intent = this.normalizeIntentLabel(raw);
         if (intent) {
-          logger.info(`[Stage 1 Intent Classifier] Gemini classified "${text}" as "${intent}"`);
+          logger.info(`[AI] Gemini succeeded (${geminiModel}) -> Intent: "${intent}"`);
           return intent;
         }
       } catch (err: any) {
-        logger.warn(`Stage 1 Gemini classification failed: ${err.message}`);
+        const status = err?.status || err?.statusCode;
+        if (status === 401 || status === 403 || status === 404) {
+          isGeminiConfigError = true;
+          logger.error(`[AI] Gemini configuration error (${status}): ${err.message}`);
+        } else {
+          logger.warn(`[AI] Gemini rate limited / failed (${err.message}). Falling back to Groq...`);
+        }
       }
     }
 
-    logger.info(`[Stage 1 Intent Classifier] Fallback heuristic classified "${text}" as "${heuristicIntent}"`);
+    // 2. Groq (SECONDARY FALLBACK PROVIDER)
+    let isGroqConfigError = false;
+    if (this.groqClient && !isGeminiConfigError) {
+      logger.info(`[AI] Gemini unavailable or rate limited. Trying Groq fallback (${process.env.GROQ_MODEL || env.GROQ_MODEL || 'groq/compound'})...`);
+      const candidateModels = this.getGroqCandidateModels();
+      for (const model of candidateModels) {
+        try {
+          const completion = await this.groqClient.chat.completions.create({
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            model,
+            temperature: 0.0,
+          });
+          const raw = completion.choices[0]?.message?.content?.trim().toLowerCase() || '';
+          const intent = this.normalizeIntentLabel(raw);
+          if (intent) {
+            logger.info(`[AI] Groq fallback succeeded (${model}) -> Intent: "${intent}"`);
+            return intent;
+          }
+        } catch (err: any) {
+          const analysis = analyzeGroqError(err, model);
+          if (analysis.isConfigError) {
+            isGroqConfigError = true;
+          }
+        }
+      }
+    }
+
+    // 3. OpenRouter (TERTIARY FALLBACK PROVIDER)
+    if (!isGeminiConfigError && !isGroqConfigError) {
+      logger.info('[AI] Gemini and Groq unavailable. Trying OpenRouter fallback...');
+      const openRouterRaw = await this.callOpenRouter(systemPrompt, userPrompt, false);
+      if (openRouterRaw) {
+        const intent = this.normalizeIntentLabel(openRouterRaw.trim().toLowerCase());
+        if (intent) {
+          logger.info(`[AI] OpenRouter fallback succeeded -> Intent: "${intent}"`);
+          return intent;
+        }
+      }
+    }
+
+    // 4. Heuristic Fallback Classifier
+    logger.info(`[AI] All AI providers failed or unconfigured. Fallback heuristic classified "${text}" as "${heuristicIntent}"`);
     return heuristicIntent;
   }
 
@@ -137,7 +312,6 @@ A pending question context may be provided. If present, strongly favor classifyi
   ): IntentCategory {
     if (pendingClarification) {
       const words = lower.split(' ').filter(Boolean);
-      // Single-word or 2-word replies when a question is pending are clarification replies (e.g. "spent", "income", "this week", "Rent")
       if (words.length <= 2) {
         return 'clarification_reply';
       }
@@ -191,7 +365,7 @@ A pending question context may be provided. If present, strongly favor classifyi
   }
 
   // ─────────────────────────────────────────────────────────────
-  // STAGE 2a: TRANSACTION EXTRACTION
+  // STAGE 2a: TRANSACTION EXTRACTION (Gemini Primary -> Groq Secondary -> OpenRouter Tertiary -> Heuristic)
   // ─────────────────────────────────────────────────────────────
   async extractTransaction(
     rawMessage: string,
@@ -231,45 +405,21 @@ Message: "rice and beans, 20000"
 Output: {"type":"unclear","amount":20000,"category":"Other","description":"rice and beans","needsClarification":true,"clarificationQuestion":"Is this money you spent (buying rice and beans) or money you made (selling them)?"}`;
 
     const userPrompt = `Message: "${text}"`;
+    let isGeminiConfigError = false;
 
-    if (this.groqClient) {
-      try {
-        const completion = await this.groqClient.chat.completions.create({
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
-          model: 'llama-3.3-70b-versatile',
-          temperature: 0.1,
-          response_format: { type: 'json_object' },
-        });
-        const raw = completion.choices[0]?.message?.content || '';
-        const json = JSON.parse(raw.replace(/```json|```/g, '').trim());
-        if (json && (json.type || json.amount !== undefined)) {
-          return {
-            type: json.type || 'unclear',
-            amount: typeof json.amount === 'number' ? json.amount : null,
-            category: json.category || 'Other',
-            description: json.description || text,
-            needsClarification: Boolean(json.needsClarification),
-            clarificationQuestion: json.clarificationQuestion || null,
-          };
-        }
-      } catch (err: any) {
-        logger.warn(`Stage 2a Groq extraction failed: ${err.message}`);
-      }
-    }
-
+    // 1. Gemini (PRIMARY PROVIDER)
     if (this.geminiClient) {
+      const geminiModel = this.getGeminiModelName();
       try {
         const model = this.geminiClient.getGenerativeModel({
-          model: 'gemini-1.5-flash',
+          model: geminiModel,
           generationConfig: { responseMimeType: 'application/json' },
         });
         const response = await model.generateContent(`${systemPrompt}\n\n${userPrompt}`);
         const raw = response.response.text() || '';
         const json = JSON.parse(raw.replace(/```json|```/g, '').trim());
         if (json) {
+          logger.info(`[AI] Gemini (${geminiModel}) successfully extracted transaction.`);
           return {
             type: json.type || 'unclear',
             amount: typeof json.amount === 'number' ? json.amount : null,
@@ -277,15 +427,86 @@ Output: {"type":"unclear","amount":20000,"category":"Other","description":"rice 
             description: json.description || text,
             needsClarification: Boolean(json.needsClarification),
             clarificationQuestion: json.clarificationQuestion || null,
+            provider: 'gemini',
           };
         }
       } catch (err: any) {
-        logger.warn(`Stage 2a Gemini extraction failed: ${err.message}`);
+        const status = err?.status || err?.statusCode;
+        if (status === 401 || status === 403 || status === 404) {
+          isGeminiConfigError = true;
+          logger.error(`[AI] Gemini configuration error (${status}): ${err.message}`);
+        } else {
+          logger.warn(`[AI] Gemini extraction failed: ${err.message}. Trying Groq fallback...`);
+        }
       }
     }
 
-    // Heuristic extraction fallback
-    return this.heuristicExtractTransaction(text, knownCategories);
+    // 2. Groq (SECONDARY FALLBACK PROVIDER)
+    let isGroqConfigError = false;
+    if (this.groqClient && !isGeminiConfigError) {
+      const candidateModels = this.getGroqCandidateModels();
+      for (const model of candidateModels) {
+        try {
+          const completion = await this.groqClient.chat.completions.create({
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            model,
+            temperature: 0.1,
+            response_format: { type: 'json_object' },
+          });
+          const raw = completion.choices[0]?.message?.content || '';
+          const json = JSON.parse(raw.replace(/```json|```/g, '').trim());
+          if (json && (json.type || json.amount !== undefined)) {
+            logger.info(`[AI] Groq fallback (${model}) successfully extracted transaction.`);
+            return {
+              type: json.type || 'unclear',
+              amount: typeof json.amount === 'number' ? json.amount : null,
+              category: json.category || 'Other',
+              description: json.description || text,
+              needsClarification: Boolean(json.needsClarification),
+              clarificationQuestion: json.clarificationQuestion || null,
+              provider: 'groq',
+            };
+          }
+        } catch (err: any) {
+          const analysis = analyzeGroqError(err, model);
+          if (analysis.isConfigError) {
+            isGroqConfigError = true;
+          }
+        }
+      }
+    }
+
+    // 3. OpenRouter (TERTIARY FALLBACK PROVIDER)
+    if (!isGeminiConfigError && !isGroqConfigError) {
+      const openRouterRaw = await this.callOpenRouter(systemPrompt, userPrompt, true);
+      if (openRouterRaw) {
+        try {
+          const json = JSON.parse(openRouterRaw.replace(/```json|```/g, '').trim());
+          if (json) {
+            logger.info('[AI] OpenRouter fallback successfully extracted transaction.');
+            return {
+              type: json.type || 'unclear',
+              amount: typeof json.amount === 'number' ? json.amount : null,
+              category: json.category || 'Other',
+              description: json.description || text,
+              needsClarification: Boolean(json.needsClarification),
+              clarificationQuestion: json.clarificationQuestion || null,
+              provider: 'openrouter',
+            };
+          }
+        } catch (err: any) {
+          logger.warn(`[AI] Failed to parse JSON from OpenRouter response: ${err.message}`);
+        }
+      }
+    }
+
+    // 4. Heuristic Fallback
+    const fallbackResult = this.heuristicExtractTransaction(text, knownCategories);
+    fallbackResult.provider = 'heuristic';
+    return fallbackResult;
   }
 
   private heuristicExtractTransaction(text: string, knownCategories: string[]): ExtractedTransaction {
@@ -340,7 +561,7 @@ Output: {"type":"unclear","amount":20000,"category":"Other","description":"rice 
   }
 
   // ─────────────────────────────────────────────────────────────
-  // STAGE 2b: CORRECTION HANDLER
+  // STAGE 2b: CORRECTION HANDLER (Gemini Primary -> Groq Secondary -> OpenRouter Tertiary -> Heuristic)
   // ─────────────────────────────────────────────────────────────
   async handleCorrection(
     rawMessage: string,
@@ -363,25 +584,78 @@ Return ONLY JSON with the fields that should change (omit unchanged fields):
 
 If the correction doesn't specify a field, don't include it — the existing value stays.`;
 
-    if (this.groqClient) {
+    const userPrompt = `Correction text: "${text}"`;
+    let isGeminiConfigError = false;
+
+    // 1. Gemini (PRIMARY PROVIDER)
+    if (this.geminiClient) {
+      const geminiModel = this.getGeminiModelName();
       try {
-        const completion = await this.groqClient.chat.completions.create({
-          messages: [{ role: 'system', content: systemPrompt }],
-          model: 'llama-3.3-70b-versatile',
-          temperature: 0.0,
-          response_format: { type: 'json_object' },
+        const model = this.geminiClient.getGenerativeModel({
+          model: geminiModel,
+          generationConfig: { responseMimeType: 'application/json' },
         });
-        const raw = completion.choices[0]?.message?.content || '';
+        const response = await model.generateContent(`${systemPrompt}\n\n${userPrompt}`);
+        const raw = response.response.text() || '';
         const diff = JSON.parse(raw.replace(/```json|```/g, '').trim());
-        if (diff) return diff;
+        if (diff) {
+          diff.provider = 'gemini';
+          return diff;
+        }
       } catch (err: any) {
-        logger.warn(`Stage 2b Groq correction diff failed: ${err.message}`);
+        const status = err?.status || err?.statusCode;
+        if (status === 401 || status === 403 || status === 404) {
+          isGeminiConfigError = true;
+        }
       }
     }
 
-    // Heuristic correction fallback
+    // 2. Groq (SECONDARY FALLBACK PROVIDER)
+    let isGroqConfigError = false;
+    if (this.groqClient && !isGeminiConfigError) {
+      const candidateModels = this.getGroqCandidateModels();
+      for (const model of candidateModels) {
+        try {
+          const completion = await this.groqClient.chat.completions.create({
+            messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+            model,
+            temperature: 0.0,
+            response_format: { type: 'json_object' },
+          });
+          const raw = completion.choices[0]?.message?.content || '';
+          const diff = JSON.parse(raw.replace(/```json|```/g, '').trim());
+          if (diff) {
+            diff.provider = 'groq';
+            return diff;
+          }
+        } catch (err: any) {
+          const analysis = analyzeGroqError(err, model);
+          if (analysis.isConfigError) {
+            isGroqConfigError = true;
+          }
+        }
+      }
+    }
+
+    // 3. OpenRouter (TERTIARY FALLBACK PROVIDER)
+    if (!isGeminiConfigError && !isGroqConfigError) {
+      const openRouterRaw = await this.callOpenRouter(systemPrompt, userPrompt, true);
+      if (openRouterRaw) {
+        try {
+          const diff = JSON.parse(openRouterRaw.replace(/```json|```/g, '').trim());
+          if (diff) {
+            diff.provider = 'openrouter';
+            return diff;
+          }
+        } catch (err: any) {
+          logger.warn(`Stage 2b OpenRouter diff JSON parse failed: ${err.message}`);
+        }
+      }
+    }
+
+    // 4. Heuristic Fallback
     const lower = text.toLowerCase();
-    const diff: CorrectionDiff = {};
+    const diff: CorrectionDiff = { provider: 'heuristic' };
 
     const categoryMap: [string, string][] = [
       ['rent', 'Rent'], ['sales', 'Sales'], ['sale', 'Sales'], ['transport', 'Transport'],

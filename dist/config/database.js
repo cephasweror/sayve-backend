@@ -5,6 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.connectDB = connectDB;
 exports.disconnectDB = disconnectDB;
+const dns_1 = __importDefault(require("dns"));
 const mongoose_1 = __importDefault(require("mongoose"));
 const env_1 = require("./env");
 const logger_1 = require("../utils/logger");
@@ -13,6 +14,11 @@ async function connectDB() {
         if (mongoose_1.default.connection.readyState >= 1) {
             return;
         }
+        // Set fallback public DNS servers (8.8.8.8, 1.1.1.1) to ensure MongoDB Atlas SRV lookup succeeds on all Wi-Fi routers
+        try {
+            dns_1.default.setServers(['8.8.8.8', '1.1.1.1']);
+        }
+        catch (dnsErr) { }
         await mongoose_1.default.connect(env_1.env.MONGODB_URI);
         logger_1.logger.info('✅ Connected to MongoDB database successfully');
     }

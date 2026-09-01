@@ -318,8 +318,16 @@ export class WebhookController {
         senderPhone,
         'ℹ️ I could not find a clear transaction or command. You can log income/expenses, ask *"how much did I make this week"*, or reply *"send my report"*.'
       );
-    } catch (error) {
-      logger.error('Error handling webhook POST:', error);
+    } catch (error: any) {
+      logger.error(`Error processing incoming message from ${senderPhone}:`, error?.message || error);
+      try {
+        await whatsappService.sendTextMessage(
+          senderPhone,
+          "Sorry, I'm having trouble processing that right now — please try again in a moment."
+        );
+      } catch (replyError) {
+        logger.error('Failed to send error fallback WhatsApp message:', replyError);
+      }
     }
   }
 }

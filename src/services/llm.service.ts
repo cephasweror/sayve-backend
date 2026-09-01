@@ -1,15 +1,11 @@
 import { Groq } from 'groq-sdk';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import axios from 'axios';
 import { z } from 'zod';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import { normalizeNigerianMarketNumbers } from './parser.service';
 
-// ─────────────────────────────────────────────────────────────
-// Output schema — every LLM response (Groq, Gemini, or the local
-// fallback) is validated against this before anything downstream
-// trusts it. If it doesn't match, we treat it as a failed call.
-// ─────────────────────────────────────────────────────────────
 const TransactionItemSchema = z.object({
   type: z.enum(['income', 'expense', 'gain', 'loss']).nullable(),
   amount: z.number().nullable(),
@@ -40,24 +36,78 @@ export interface UserContext {
 }
 
 export class LLMService {
-  private groqClient: Groq | null = null;
   private geminiClient: GoogleGenerativeAI | null = null;
+  private groqClient: Groq | null = null;
 
   constructor() {
-    if (env.GROQ_API_KEY && env.GROQ_API_KEY !== 'mock_groq_key') {
-      this.groqClient = new Groq({ apiKey: env.GROQ_API_KEY });
+    const rawGeminiKey = process.env.GEMINI_API_KEY || env.GEMINI_API_KEY;
+    const rawGroqKey = process.env.GROQ_API_KEY || env.GROQ_API_KEY;
+
+    if (rawGeminiKey && rawGeminiKey !== 'mock_gemini_key' && !rawGeminiKey.includes('your_') && rawGeminiKey.length > 10) {
+      this.geminiClient = new GoogleGenerativeAI(rawGeminiKey);
     }
-    if (env.GEMINI_API_KEY && env.GEMINI_API_KEY !== 'mock_gemini_key') {
-      this.geminiClient = new GoogleGenerativeAI(env.GEMINI_API_KEY);
+    if (rawGroqKey && rawGroqKey !== 'mock_groq_key' && !rawGroqKey.includes('your_') && rawGroqKey.length > 10) {
+      this.groqClient = new Groq({ apiKey: rawGroqKey });
     }
+  }
+
+  private async callOpenRouter(systemPrompt: string, userPrompt: string, isJson: boolean = true): Promise<string | null> {
+    const apiKey = process.env.OPENROUTER_API_KEY || env.OPENROUTER_API_KEY;
+    if (!apiKey || apiKey === 'mock_openrouter_key' || apiKey.includes('your_') || apiKey.length < 10) {
+      return null;
+    }
+
+    const primaryModel = process.env.OPENROUTER_MODEL || env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free';
+    const models = Array.from(new Set([primaryModel, 'meta-llama/llama-3.3-70b-instruct:free', 'google/gemini-2.0-flash-lite-001:free', 'openrouter/auto']));
+
+    for (const model of models) {
+      try {
+        const payload: any = {
+          model,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          temperature: 0.1,
+        };
+        if (isJson) {
+          payload.response_format = { type: 'json_object' };
+        }
+
+        const response = await axios.post(
+          'https://openrouter.ai/api/v1/chat/completions',
+          payload,
+          {
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              'HTTP-Referer': 'https://sayve.app',
+              'X-Title': 'Sayve WhatsApp Expense Tracker',
+              'Content-Type': 'application/json',
+            },
+            timeout: 12000,
+          }
+        );
+
+        const content = response.data?.choices?.[0]?.message?.content;
+        if (content) {
+          logger.info(`[AI] OpenRouter (${model}) succeeded`);
+          return content;
+        }
+      } catch (err: any) {
+        const status = err.response?.status;
+        if (status === 401) {
+          logger.error(`[AI] OpenRouter 401 error: ${err.message}`);
+          break;
+        }
+        logger.warn(`[AI] OpenRouter (${model}) failed: ${err.message}`);
+      }
+    }
+    return null;
   }
 
   /**
    * Parse a raw WhatsApp message into a structured, validated
-   * transaction. Number shorthand is normalized ONCE, up front, so
-   * Groq, Gemini, and the last-resort fallback all see the same
-   * clean input — this was silently skipped before for both real
-   * LLM calls.
+   * transaction using priority order: Gemini (Primary) -> Groq (Fallback) -> OpenRouter (Tertiary) -> Heuristic.
    */
   async parseMessage(rawText: string, ctx: UserContext): Promise<ParsedMessage> {
     const normalizedText = normalizeNigerianMarketNumbers(rawText);
@@ -65,116 +115,160 @@ export class LLMService {
     const today = new Date().toISOString().split('T')[0];
     const userPrompt = `today_date: ${today}\nis_batch: false\nmessage_text: "${normalizedText}"`;
 
-    // 1. Groq — primary. One retry with backoff on rate limits/transient errors.
-    if (this.groqClient) {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          const completion = await this.groqClient.chat.completions.create({
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userPrompt },
-            ],
-            model: 'llama-3.3-70b-versatile',
-            temperature: 0.1,
-            response_format: { type: 'json_object' },
-          });
-          const raw = completion.choices[0]?.message?.content || '';
-          const parsed = safeParseAndValidate(raw);
-          if (parsed) {
-            logger.llm('Groq Llama 3.3 70B', userPrompt, raw);
-            return parsed;
-          }
-          logger.warn(`Groq returned invalid/unvalidatable JSON on attempt ${attempt + 1}`);
-        } catch (err: any) {
-          logger.warn(`Groq call failed (attempt ${attempt + 1}):`, err.message);
-          if (err.status === 429) await sleep(500 * (attempt + 1));
-        }
-      }
-    } else {
-      logger.info('Groq API key not configured, going straight to Gemini');
-    }
+    let isGeminiConfigError = false;
 
-    // 2. Gemini — fallback, JSON mode forced via generationConfig so we're
-    // not hoping the model remembers to skip markdown fences / prose.
+    // 1. Gemini (PRIMARY PROVIDER)
     if (this.geminiClient) {
+      const geminiModel = process.env.GEMINI_MODEL || env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
       try {
         const model = this.geminiClient.getGenerativeModel({
-          model: 'gemini-1.5-flash',
+          model: geminiModel,
           generationConfig: { responseMimeType: 'application/json' },
         });
         const response = await model.generateContent(`${systemPrompt}\n\n${userPrompt}`);
         const raw = response.response.text() || '';
         const parsed = safeParseAndValidate(raw);
         if (parsed) {
-          logger.llm('Gemini 2.5 Flash', userPrompt, raw);
+          logger.llm(`Gemini Primary (${geminiModel})`, userPrompt, raw);
           return parsed;
         }
-        logger.warn('Gemini returned invalid/unvalidatable JSON');
       } catch (err: any) {
-        logger.warn('Gemini call failed:', err.message);
+        const status = err?.status || err?.statusCode;
+        if (status === 401 || status === 403 || status === 404) {
+          isGeminiConfigError = true;
+          logger.error(`[AI] Gemini Primary config error (${status}): ${err.message}`);
+        } else {
+          logger.warn(`[AI] Gemini Primary failed (${err.message}). Trying Groq fallback...`);
+        }
+      }
+    } else {
+      logger.info('Gemini API key not configured, going to Groq fallback');
+    }
+
+    // 2. Groq (SECONDARY FALLBACK PROVIDER)
+    let isGroqConfigError = false;
+    if (this.groqClient && !isGeminiConfigError) {
+      const candidateModels = [
+        process.env.GROQ_MODEL || env.GROQ_MODEL || 'groq/compound',
+        'groq/compound',
+        'groq/compound-mini',
+        'qwen/qwen3.6-27b',
+        'llama-3.1-8b-instant',
+        'llama-3.3-70b-versatile',
+      ];
+      const uniqueModels = Array.from(new Set(candidateModels));
+
+      for (const model of uniqueModels) {
+        try {
+          const completion = await this.groqClient.chat.completions.create({
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            model,
+            temperature: 0.1,
+            response_format: { type: 'json_object' },
+          });
+          const raw = completion.choices[0]?.message?.content || '';
+          const parsed = safeParseAndValidate(raw);
+          if (parsed) {
+            logger.llm(`Groq Fallback (${model})`, userPrompt, raw);
+            return parsed;
+          }
+        } catch (err: any) {
+          const status = err?.status || err?.statusCode;
+          if (status === 401 || status === 403) {
+            isGroqConfigError = true;
+            logger.error(`[AI] Groq Fallback config error (${status}): ${err.message}`);
+            break;
+          }
+          logger.warn(`[AI] Groq Fallback (${model}) parseMessage failed: ${err.message}`);
+        }
       }
     }
 
-    // 3. Last resort ONLY — both providers unreachable or misconfigured.
-    // Deliberately conservative: when unsure of direction, it asks rather
-    // than guesses, same as the LLM system prompt does. This should be
-    // rare in production if retries/backoff above are working; if you see
-    // this path firing often, that's a signal to fix upstream reliability,
-    // not to make the keyword list smarter.
-    logger.warn('Both LLM providers failed — using heuristic fallback');
+    // 3. OpenRouter (TERTIARY FALLBACK PROVIDER)
+    if (!isGeminiConfigError && !isGroqConfigError) {
+      const openRouterRaw = await this.callOpenRouter(systemPrompt, userPrompt, true);
+      if (openRouterRaw) {
+        const parsed = safeParseAndValidate(openRouterRaw);
+        if (parsed) {
+          logger.llm('OpenRouter Fallback', userPrompt, openRouterRaw);
+          return parsed;
+        }
+      }
+    }
+
+    // 4. Heuristic Fallback
+    logger.info('[AI] All AI providers unavailable or failed — using heuristic fallback');
     return heuristicFallback(normalizedText, today, ctx);
   }
 
   /**
-   * Free-text generation — used by reply.service.ts to write the
-   * conversational WhatsApp reply (NOT structured JSON). Same
-   * Groq-primary/Gemini-fallback order as parseMessage, but no JSON
-   * mode and no schema validation, since the output here is just text.
+   * Conversational reply generation with priority: Gemini (Primary) -> Groq (Fallback) -> OpenRouter (Tertiary) -> Fallback text
    */
   async generateCompletion(prompt: string, systemPrompt?: string): Promise<string> {
-    if (this.groqClient) {
-      try {
-        const completion = await this.groqClient.chat.completions.create({
-          messages: [
-            ...(systemPrompt ? [{ role: 'system' as const, content: systemPrompt }] : []),
-            { role: 'user' as const, content: prompt },
-          ],
-          model: 'llama-3.3-70b-versatile',
-          temperature: 0.7, // higher than the parser — replies should feel natural, not deterministic
-        });
-        const raw = completion.choices[0]?.message?.content || '';
-        if (raw) {
-          logger.llm('Groq Llama 3.3 70B (reply)', prompt, raw);
-          return raw;
-        }
-      } catch (err: any) {
-        logger.warn('Groq reply generation failed:', err.message);
-      }
-    }
+    const fullUserPrompt = prompt;
 
+    // 1. Gemini Primary
     if (this.geminiClient) {
       try {
-        const model = this.geminiClient.getGenerativeModel({ model: 'gemini-1.5-flash' });
-        const fullPrompt = `${systemPrompt ? systemPrompt + '\n\n' : ''}${prompt}`;
-        const response = await model.generateContent(fullPrompt);
+        const geminiModel = process.env.GEMINI_MODEL || env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+        const model = this.geminiClient.getGenerativeModel({ model: geminiModel });
+        const textToPass = `${systemPrompt ? systemPrompt + '\n\n' : ''}${fullUserPrompt}`;
+        const response = await model.generateContent(textToPass);
         const raw = response.response.text() || '';
         if (raw) {
-          logger.llm('Gemini 2.5 Flash (reply)', prompt, raw);
+          logger.llm(`Gemini Primary (${geminiModel}) reply`, prompt, raw);
           return raw;
         }
       } catch (err: any) {
-        logger.warn('Gemini reply generation failed:', err.message);
+        logger.warn('Gemini Primary reply generation failed:', err.message);
       }
     }
 
-    // Last resort: a plain, honest reply rather than nothing.
-    logger.warn('Both LLM providers failed — returning generic reply text');
+    // 2. Groq Fallback
+    if (this.groqClient) {
+      const candidateModels = [
+        process.env.GROQ_MODEL || env.GROQ_MODEL || 'groq/compound',
+        'groq/compound',
+        'llama-3.1-8b-instant',
+      ];
+      for (const model of Array.from(new Set(candidateModels))) {
+        try {
+          const completion = await this.groqClient.chat.completions.create({
+            messages: [
+              ...(systemPrompt ? [{ role: 'system' as const, content: systemPrompt }] : []),
+              { role: 'user' as const, content: fullUserPrompt },
+            ],
+            model,
+            temperature: 0.7,
+          });
+          const raw = completion.choices[0]?.message?.content || '';
+          if (raw) {
+            logger.llm(`Groq Fallback (${model}) reply`, prompt, raw);
+            return raw;
+          }
+        } catch (err: any) {
+          logger.warn(`Groq Fallback reply generation failed (${model}):`, err.message);
+        }
+      }
+    }
+
+    // 3. OpenRouter Tertiary
+    const openRouterReply = await this.callOpenRouter(
+      systemPrompt || 'You are Sayve, a helpful WhatsApp financial assistant.',
+      fullUserPrompt,
+      false
+    );
+    if (openRouterReply) {
+      return openRouterReply;
+    }
+
+    // 4. Fallback Text
+    logger.warn('All LLM providers failed — returning default reply text');
     return "Got it — noted. (I'm having trouble phrasing this nicely right now, but your entry was saved.)";
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function safeParseAndValidate(raw: string): ParsedMessage | null {
@@ -228,11 +322,6 @@ Respond ONLY with valid JSON matching this shape, no preamble, no markdown fence
 Never invent a business name, category, or amount. When unsure, ask one short, specific, conversational question — this is WhatsApp, not a form.`;
 }
 
-/**
- * Rule-based local parser — LAST RESORT ONLY, used when both Groq and
- * Gemini are unreachable. Kept intentionally conservative: on ambiguous
- * direction, it asks rather than guesses.
- */
 function heuristicFallback(text: string, today: string, ctx: UserContext): ParsedMessage {
   const lower = text.toLowerCase().trim();
 
@@ -290,7 +379,6 @@ function heuristicFallback(text: string, today: string, ctx: UserContext): Parse
   const numbers = text.match(/\d+[\d,]*/g);
   const amount = numbers?.length ? Math.max(...numbers.map(n => parseInt(n.replace(/,/g, ''), 10))) : null;
 
-  // Ambiguous direction — ask rather than guess
   if (!type && amount !== null) {
     return ParsedMessageSchema.parse({
       needs_clarification: true,

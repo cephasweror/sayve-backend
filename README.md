@@ -1,6 +1,6 @@
 # Sayve - WhatsApp AI Expense & Income Tracker Backend 🇳🇬
 
-Sayve is a WhatsApp-based AI expense and income tracking system designed specifically for Nigerian small business owners. Users send natural-language **text messages** or **voice notes** describing transactions (*"sold 3 bags of rice for 45000"*, *"spent 5000 on transport"*), and Sayve automatically transcribes voice notes (via Groq Whisper), parses them using Groq LLM (Llama 3.3 70B) with Gemini Flash fallback, logs them into MongoDB, and generates summaries and CSV report exports on command — all directly within WhatsApp.
+Sayve is a WhatsApp-based AI expense and income tracking system designed specifically for Nigerian small business owners. Users send natural-language **text messages** or **voice notes** describing transactions (*"sold 3 bags of rice for 45000"*, *"spent 5000 on transport"*), and Sayve automatically transcribes voice notes (via Groq Whisper), parses them using Gemini (`gemini-2.5-flash-lite`) with Groq and OpenRouter fallbacks, logs them into MongoDB, and generates summaries and report exports on command — all directly within WhatsApp.
 
 ---
 
@@ -8,7 +8,7 @@ Sayve is a WhatsApp-based AI expense and income tracking system designed specifi
 
 - **Backend Framework**: Node.js & Express (TypeScript)
 - **WhatsApp Integration**: Meta WhatsApp Business Cloud API (Official REST API)
-- **LLM Engine**: Primary: Groq API (`llama-3.3-70b-versatile`) | Fallback: Google Gemini Flash (`gemini-1.5-flash`)
+- **LLM Engine**: Primary: Google Gemini (`gemini-2.5-flash-lite`) | Fallback: Groq API (`groq/compound`) | Tertiary: OpenRouter
 - **Voice Note Transcription**: Groq Whisper API (`whisper-large-v3`) — supports English, Nigerian Pidgin & mixed languages
 - **Database**: MongoDB (Mongoose ORM)
 - **Export Engine**: CSV Generator (`json2csv`)

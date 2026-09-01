@@ -11,7 +11,7 @@ const whatsapp_service_1 = require("../services/whatsapp.service");
 const audio_service_1 = require("../services/audio.service");
 const image_service_1 = require("../services/image.service");
 const Transaction_1 = require("../models/Transaction");
-const formatters_1 = require("../utils/formatters");
+const reply_service_1 = require("../services/reply.service");
 const HELP_MESSAGE = '📖 *Sayve Commands*\n\n' +
     '*Log income:*\n• "sold 3 bags of rice for 45000"\n\n' +
     '*Log expense:*\n• "spent 5000 on transport"\n\n' +
@@ -133,61 +133,84 @@ class WebhookController {
                 await whatsapp_service_1.whatsappService.sendTextMessage(senderPhone, HELP_MESSAGE);
                 return;
             }
-            // 4. Parse intent and structured transaction using LLM
-            const intent = await parser_service_1.parserService.parseUserMessage(incomingText);
-            if (!intent) {
+            // 4. Pass #1: Extract structured data from user message
+            const knownCategories = (await Transaction_1.Transaction.distinct('category', { userId: user._id }));
+            const context = {
+                business_name: user.businessName || null,
+                known_categories: knownCategories && knownCategories.length > 0 ? knownCategories : ['Sales', 'Inventory', 'Transport', 'Utilities', 'Salaries', 'Rent', 'Food', 'Fuel', 'Other'],
+                today_date: new Date().toISOString().split('T')[0],
+                is_batch: messageType === 'image',
+            };
+            const parsed = await parser_service_1.parserService.parseUserMessage(incomingText, context);
+            if (!parsed) {
                 await whatsapp_service_1.whatsappService.sendTextMessage(senderPhone, '🤔 I could not understand that. Try: *"sold 3 bags of rice for 45000"*, *"spent 5000 on transport"*, or type *"help"* to see all commands.');
                 return;
             }
-            // 5. Intent Routing
-            // Option A: Category Correction (e.g., "no, it's Rent")
-            if (intent.isCorrection) {
+            // 5. Intent Routing & Pass #2 Reply Generation
+            // Option A: Clarification needed (missing type, ambiguous direction, or missing business)
+            if (parsed.needs_clarification && parsed.clarification_question) {
+                const humanQuestion = reply_service_1.replyService.generateClarifyingQuestion(parsed.clarification_question);
+                logger_1.logger.info(`Sending human clarification question to ${senderPhone}: "${humanQuestion}"`);
+                await whatsapp_service_1.whatsappService.sendTextMessage(senderPhone, `❓ ${humanQuestion}`);
+                return;
+            }
+            // Option B: Category Correction (e.g., "no, it's Rent")
+            if (parsed.isCorrection) {
                 if (!user.lastTransactionId) {
                     await whatsapp_service_1.whatsappService.sendTextMessage(senderPhone, '⚠️ No recent transaction found to correct.');
                     return;
                 }
                 const lastTx = await Transaction_1.Transaction.findById(user.lastTransactionId);
-                if (lastTx && intent.correctedCategory) {
+                if (lastTx && parsed.correctedCategory) {
                     const oldCat = lastTx.category;
-                    lastTx.category = intent.correctedCategory;
+                    lastTx.category = parsed.correctedCategory;
                     await lastTx.save();
-                    await whatsapp_service_1.whatsappService.sendTextMessage(senderPhone, `✏️ Category updated for *${lastTx.description}* from ${oldCat} ➡️ *${lastTx.category}*.`);
+                    await whatsapp_service_1.whatsappService.sendTextMessage(senderPhone, `Got it! Category updated for *${lastTx.description}* to *${lastTx.category}* ✅`);
                     return;
                 }
             }
-            // Option B: Financial Summary Query
-            if (intent.isSummaryQuery) {
-                const summaryText = await summary_service_1.summaryService.getSummary(user, intent.queryPeriod);
+            // Option C: Financial Summary Query
+            if (parsed.isSummaryQuery) {
+                const summaryText = await summary_service_1.summaryService.getSummary(user, parsed.queryPeriod);
                 await whatsapp_service_1.whatsappService.sendTextMessage(senderPhone, summaryText);
                 return;
             }
-            // Option C: CSV Data Export Request
-            if (intent.isExportRequest) {
-                await whatsapp_service_1.whatsappService.sendTextMessage(senderPhone, '⏳ Generating your 30-day transaction report CSV...');
+            // Option D: CSV Data Export Request
+            if (parsed.isExportRequest) {
+                await whatsapp_service_1.whatsappService.sendTextMessage(senderPhone, '⏳ Generating your transaction report CSV...');
                 await export_service_1.exportService.exportAndSendReport(user);
                 return;
             }
-            // Option D: Log Transaction
-            if (intent.isTransaction && intent.amount && intent.amount > 0) {
-                const tx = await Transaction_1.Transaction.create({
-                    userId: user._id,
-                    phoneNumber: senderPhone,
-                    type: intent.type || 'income',
-                    amount: intent.amount,
-                    category: intent.category || 'Other',
-                    description: intent.description || incomingText,
-                    rawMessage: incomingText,
-                    date: new Date(),
-                });
-                // Store last transaction ID for correction tracking
-                user.lastTransactionId = tx._id;
-                try {
-                    await user.save();
+            // Option E: Log Transactions (Single or Batch) via Pass #2 Persona Reply Generator
+            const validItems = parsed.items.filter(item => item.amount !== null && item.amount > 0);
+            if (validItems.length > 0) {
+                const createdTxs = [];
+                for (const item of validItems) {
+                    const txDate = item.date ? new Date(item.date) : new Date();
+                    const tx = await Transaction_1.Transaction.create({
+                        userId: user._id,
+                        phoneNumber: senderPhone,
+                        type: item.type || 'income',
+                        amount: item.amount,
+                        category: item.category || (item.type === 'income' ? 'Sales' : 'Other'),
+                        description: item.description || incomingText,
+                        rawMessage: incomingText,
+                        businessName: item.business_name || user.businessName,
+                        date: isNaN(txDate.getTime()) ? new Date() : txDate,
+                    });
+                    createdTxs.push(tx);
                 }
-                catch (e) { }
-                const formattedAmount = (0, formatters_1.formatCurrency)(tx.amount, user.currency);
-                const typeLabel = tx.type === 'income' ? 'income' : 'expense';
-                await whatsapp_service_1.whatsappService.sendTextMessage(senderPhone, `✅ Logged: *${formattedAmount} ${typeLabel}* — ${tx.category} (${tx.description}).`);
+                // Store last transaction ID for correction tracking
+                if (createdTxs.length > 0) {
+                    user.lastTransactionId = createdTxs[createdTxs.length - 1]._id;
+                    try {
+                        await user.save();
+                    }
+                    catch (e) { }
+                }
+                // Pass #2: Generate human WhatsApp confirmation reply using ReplyService
+                const replyText = await reply_service_1.replyService.generateLogReply(user, createdTxs);
+                await whatsapp_service_1.whatsappService.sendTextMessage(senderPhone, replyText);
                 return;
             }
             // Fallback response

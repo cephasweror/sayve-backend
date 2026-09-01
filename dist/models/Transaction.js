@@ -38,15 +38,12 @@ const mongoose_1 = __importStar(require("mongoose"));
 const TransactionSchema = new mongoose_1.Schema({
     userId: { type: mongoose_1.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     phoneNumber: { type: String, required: true },
-    type: { type: String, enum: ['income', 'expense'], required: true },
+    type: { type: String, enum: ['income', 'expense', 'gain', 'loss'], required: true },
     amount: { type: Number, required: true, min: 0 },
-    category: {
-        type: String,
-        enum: ['Sales', 'Inventory', 'Transport', 'Utilities', 'Salaries', 'Rent', 'Other'],
-        default: 'Other',
-    },
+    category: { type: String, default: 'Other' },
     description: { type: String, required: true },
     rawMessage: { type: String, required: true },
+    businessName: { type: String },
     date: { type: Date, default: Date.now },
 }, { timestamps: true });
 exports.Transaction = mongoose_1.default.model('Transaction', TransactionSchema);

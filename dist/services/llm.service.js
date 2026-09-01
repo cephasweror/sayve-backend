@@ -39,7 +39,7 @@ class LLMService {
                     return rawOutput;
             }
             catch (groqError) {
-                logger_1.logger.warn('Groq API call failed or rate-limited. Falling back to Gemini Flash:', groqError.message);
+                logger_1.logger.warn('Groq API call failed or rate-limited:', groqError.message);
             }
         }
         else {
@@ -48,7 +48,7 @@ class LLMService {
         // 2. Fallback LLM: Google Gemini Flash
         if (this.geminiClient) {
             try {
-                logger_1.logger.info('Calling Gemini Flash fallback...');
+                logger_1.logger.info('Calling Gemini Flash fallback (gemini-1.5-flash)...');
                 const fullPrompt = `${systemPrompt ? systemPrompt + '\n\n' : ''}${prompt}`;
                 const model = this.geminiClient.getGenerativeModel({ model: 'gemini-1.5-flash' });
                 const response = await model.generateContent(fullPrompt);
@@ -58,7 +58,7 @@ class LLMService {
                     return rawOutput;
             }
             catch (geminiError) {
-                logger_1.logger.error('Gemini Flash API call also failed:', geminiError.message);
+                logger_1.logger.warn('Gemini Flash API call failed:', geminiError.message);
             }
         }
         // 3. Heuristic Mock Fallback if no API keys are provided or all failed
@@ -69,11 +69,10 @@ class LLMService {
      * Rule-based local parser when APIs are offline or unconfigured
      */
     mockLLMFallback(prompt) {
-        // Extract just the user's message from the wrapper prompt to avoid
-        // false-positive keyword matches in the prompt prefix (e.g., 'business' → 'bus' → Transport)
-        const quoteMatch = prompt.match(/"([^"]+)"/);
-        const text = (quoteMatch ? quoteMatch[1] : prompt).toLowerCase();
-        // Check if summary query
+        const userMsgMatch = prompt.match(/Parse this incoming WhatsApp message from a business owner: "([^"]+)"/);
+        const text = (userMsgMatch ? userMsgMatch[1] : prompt).toLowerCase().trim();
+        const today = new Date().toISOString().split('T')[0];
+        // 1. Check if summary query
         if (text.includes('how much') ||
             text.includes('summary') ||
             text.includes('spent this month') ||
@@ -82,30 +81,48 @@ class LLMService {
             text.includes('made this week') ||
             text.includes('made today') ||
             text.includes('income today') ||
-            text.includes('profit this')) {
+            text.includes('profit this') ||
+            text.includes('track my money') ||
+            text.includes('track money') ||
+            text.includes('track expenses') ||
+            text.includes('track sales')) {
             let queryPeriod = 'month';
             if (text.includes('week'))
                 queryPeriod = 'week';
             else if (text.includes('today') || text.includes('today\'s'))
                 queryPeriod = 'today';
             return JSON.stringify({
-                isTransaction: false,
-                isCorrection: false,
+                needs_clarification: false,
+                clarification_question: null,
+                is_batch: false,
                 isSummaryQuery: true,
-                isExportRequest: false,
                 queryPeriod,
+                isExportRequest: false,
+                isCorrection: false,
+                items: [],
             });
         }
-        // Check if export request
-        if (text.includes('send my report') || text.includes('export') || text.includes('csv')) {
+        // 2. Check if export request (handles typos like 'cvs', 'excel', 'report', 'download')
+        if (text.includes('send my report') ||
+            text.includes('export') ||
+            text.includes('csv') ||
+            text.includes('cvs') ||
+            text.includes('report') ||
+            text.includes('excel') ||
+            text.includes('download') ||
+            text.includes('spreadsheet') ||
+            text.includes('file')) {
             return JSON.stringify({
-                isTransaction: false,
-                isCorrection: false,
+                needs_clarification: false,
+                clarification_question: null,
+                is_batch: false,
                 isSummaryQuery: false,
                 isExportRequest: true,
+                isCorrection: false,
+                items: [],
             });
         }
-        // Check if correction request
+        // 3. Check if correction request
         if (text.startsWith('no,') || text.includes("it's") || text.includes('change category')) {
             let category = 'Other';
             if (text.includes('rent'))
@@ -121,27 +138,68 @@ class LLMService {
             else if (text.includes('utility') || text.includes('bill') || text.includes('nepa'))
                 category = 'Utilities';
             return JSON.stringify({
-                isTransaction: false,
-                isCorrection: true,
-                correctedCategory: category,
+                needs_clarification: false,
+                clarification_question: null,
+                is_batch: false,
                 isSummaryQuery: false,
                 isExportRequest: false,
+                isCorrection: true,
+                correctedCategory: category,
+                items: [],
             });
         }
-        // Default: Transaction parsing heuristic
-        const isExpense = text.includes('spent') || text.includes('bought') || text.includes('pay') || text.includes('cost');
-        const type = isExpense ? 'expense' : 'income';
+        // Import normalizer
+        const { normalizeNigerianMarketNumbers } = require('./parser.service');
+        // 4. Transaction parsing heuristic
+        const isIncome = text.includes('sold') || text.includes('sale') || text.includes('received') || text.includes('paid me') || text.includes('alert') || text.includes('cash enter') || text.includes('income') || text.includes('made') || text.includes('make') || text.includes('earn') || text.includes('earned') || text.includes('collect');
+        const isExpense = text.includes('spent') || text.includes('bought') || text.includes('paid for') || text.includes('pay') || text.includes('cost') || text.includes('chop money') || text.includes('expense');
+        const isGain = text.includes('profit') || text.includes('dash') || text.includes('bonus') || text.includes('gain');
+        const isLoss = text.includes('loss') || text.includes('lost') || text.includes('spoilt') || text.includes('damaged') || text.includes('stolen') || text.includes('spill') || text.includes('wrote off');
+        let type = null;
+        if (isLoss)
+            type = 'loss';
+        else if (isGain)
+            type = 'gain';
+        else if (isExpense)
+            type = 'expense';
+        else if (isIncome)
+            type = 'income';
+        // Normalize Nigerian market numbers (e.g. 3k -> 3000, 2.4k -> 2400, 2k5 -> 2500)
+        const normalizedText = normalizeNigerianMarketNumbers(text);
         // Extract numbers
-        const numbers = text.match(/\d+[\d,]*/g);
-        let amount = 0;
+        const numbers = normalizedText.match(/\d+[\d,]*/g);
+        let amount = null;
         if (numbers && numbers.length > 0) {
-            const parsedNums = numbers.map(n => parseInt(n.replace(/,/g, ''), 10));
+            const parsedNums = numbers.map((n) => parseInt(n.replace(/,/g, ''), 10));
             amount = Math.max(...parsedNums);
         }
+        // Check if clarification needed (ambiguous direction e.g. "600000 fuel" without bought/sold/spent)
+        if (!type && amount !== null) {
+            return JSON.stringify({
+                needs_clarification: true,
+                clarification_question: "Is this money coming in or going out?",
+                is_batch: false,
+                items: [
+                    {
+                        type: null,
+                        amount,
+                        currency: 'NGN',
+                        category: 'Fuel',
+                        description: text,
+                        date: today,
+                        business_name: null,
+                    },
+                ],
+            });
+        }
+        // Default direction if not explicit
+        type = type || (isExpense ? 'expense' : 'income');
         // Category detection
         let category = 'Other';
-        if (text.includes('transport') || text.includes('fuel') || text.includes('bus') || text.includes('okada'))
+        if (text.includes('transport') || text.includes('bus') || text.includes('okada') || text.includes('cab'))
             category = 'Transport';
+        else if (text.includes('fuel') || text.includes('petrol') || text.includes('diesel') || text.includes('gen'))
+            category = 'Fuel';
         else if (text.includes('rice') || text.includes('sold') || text.includes('sales'))
             category = 'Sales';
         else if (text.includes('stock') || text.includes('goods') || text.includes('bag'))
@@ -153,14 +211,23 @@ class LLMService {
         else if (text.includes('salary') || text.includes('staff'))
             category = 'Salaries';
         return JSON.stringify({
-            isTransaction: true,
-            type,
-            amount,
-            category,
-            description: text.substring(0, 100),
-            isCorrection: false,
+            needs_clarification: false,
+            clarification_question: null,
+            is_batch: false,
             isSummaryQuery: false,
             isExportRequest: false,
+            isCorrection: false,
+            items: [
+                {
+                    type,
+                    amount: amount || 0,
+                    currency: 'NGN',
+                    category,
+                    description: text.substring(0, 100),
+                    date: today,
+                    business_name: null,
+                },
+            ],
         });
     }
 }
