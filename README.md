@@ -1,4 +1,4 @@
-# Sayve - WhatsApp AI Expense & Income Tracker Backend 🇳🇬
+# Sayve - WhatsApp AI Expense & Income Tracker Backend 
 
 Sayve is a WhatsApp-based AI expense and income tracking system designed specifically for Nigerian small business owners. Users send natural-language **text messages** or **voice notes** describing transactions (*"sold 3 bags of rice for 45000"*, *"spent 5000 on transport"*), and Sayve automatically transcribes voice notes (via Groq Whisper), parses them using Gemini (`gemini-2.5-flash-lite`) with Groq and OpenRouter fallbacks, logs them into MongoDB, and generates summaries and report exports on command — all directly within WhatsApp.
 
