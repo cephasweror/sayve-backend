@@ -26,6 +26,11 @@ export interface ParsedResponse {
   isDeleteLastTx?: boolean;
 
   isSummaryQuery?: boolean;
+  period?: {
+    type: 'today' | 'week' | 'month' | 'quarter' | 'year' | 'custom';
+    startDate?: string | null;
+    endDate?: string | null;
+  } | null;
   queryPeriod?: 'today' | 'week' | 'month' | 'quarter' | 'year' | 'all' | 'custom';
   startDate?: Date;
   endDate?: Date;
@@ -234,6 +239,7 @@ export class ParserService {
           exportFormat = 'csv';
         }
 
+        const periodType = dateRange.period === 'all' ? 'custom' : dateRange.period;
         return {
           needs_clarification: false,
           clarification_question: null,
@@ -242,6 +248,11 @@ export class ParserService {
           isSummaryQuery: !isExportRequest,
           isExportRequest,
           exportFormat,
+          period: {
+            type: periodType,
+            startDate: dateRange.startDate ? dateRange.startDate.toISOString().split('T')[0] : null,
+            endDate: dateRange.endDate ? dateRange.endDate.toISOString().split('T')[0] : null,
+          },
           queryPeriod: dateRange.period,
           startDate: dateRange.startDate,
           endDate: dateRange.endDate,

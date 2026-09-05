@@ -114,7 +114,7 @@ export class PipelineService {
   }
 
   private getGeminiModelName(): string {
-    return process.env.GEMINI_MODEL || env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+    return process.env.GEMINI_MODEL || env.GEMINI_MODEL || 'gemini-2.0-flash';
   }
 
   private getGroqCandidateModels(): string[] {

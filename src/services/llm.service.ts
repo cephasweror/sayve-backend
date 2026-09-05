@@ -16,13 +16,20 @@ const TransactionItemSchema = z.object({
   business_name: z.string().nullable(),
 });
 
+const PeriodSchema = z.object({
+  type: z.enum(['today', 'week', 'month', 'quarter', 'year', 'custom']),
+  startDate: z.string().nullable().default(null),
+  endDate: z.string().nullable().default(null),
+});
+
 const ParsedMessageSchema = z.object({
   needs_clarification: z.boolean(),
   clarification_question: z.string().nullable(),
   is_batch: z.boolean(),
   isSummaryQuery: z.boolean().default(false),
-  queryPeriod: z.enum(['today', 'week', 'month']).optional(),
+  period: PeriodSchema.nullable().default(null),
   isExportRequest: z.boolean().default(false),
+  exportFormat: z.enum(['csv', 'excel', 'pdf', 'unspecified']).nullable().default(null),
   isCorrection: z.boolean().default(false),
   correctedCategory: z.string().optional(),
   items: z.array(TransactionItemSchema),
@@ -119,7 +126,7 @@ export class LLMService {
 
     // 1. Gemini (PRIMARY PROVIDER)
     if (this.geminiClient) {
-      const geminiModel = process.env.GEMINI_MODEL || env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+      const geminiModel = process.env.GEMINI_MODEL || env.GEMINI_MODEL || 'gemini-2.0-flash';
       try {
         const model = this.geminiClient.getGenerativeModel({
           model: geminiModel,
@@ -213,7 +220,7 @@ export class LLMService {
     // 1. Gemini Primary
     if (this.geminiClient) {
       try {
-        const geminiModel = process.env.GEMINI_MODEL || env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+        const geminiModel = process.env.GEMINI_MODEL || env.GEMINI_MODEL || 'gemini-2.0-flash';
         const model = this.geminiClient.getGenerativeModel({ model: geminiModel });
         const textToPass = `${systemPrompt ? systemPrompt + '\n\n' : ''}${fullUserPrompt}`;
         const response = await model.generateContent(textToPass);
@@ -271,11 +278,32 @@ export class LLMService {
   }
 }
 
-function safeParseAndValidate(raw: string): ParsedMessage | null {
+export function safeParseAndValidate(raw: string): ParsedMessage | null {
   try {
     const cleaned = raw.replace(/```json|```/g, '').trim();
     const json = JSON.parse(cleaned);
-    return ParsedMessageSchema.parse(json);
+    const parsed = ParsedMessageSchema.parse(json);
+
+    // Requirement 5: Custom Range Validation Guard
+    if (parsed.period?.type === 'custom') {
+      const { startDate, endDate } = parsed.period;
+      let valid = false;
+      if (startDate && endDate) {
+        const startMs = Date.parse(startDate);
+        const endMs = Date.parse(endDate);
+        if (!isNaN(startMs) && !isNaN(endMs) && startMs <= endMs) {
+          valid = true;
+        }
+      }
+
+      if (!valid) {
+        parsed.needs_clarification = true;
+        parsed.clarification_question = "Could you give me the dates like '1 August to 30 September'? Make sure the start date comes before the end date.";
+        parsed.period = null;
+      }
+    }
+
+    return parsed;
   } catch {
     return null;
   }
@@ -295,6 +323,15 @@ TASKS, IN ORDER:
 4. PERIOD — look for explicit date words ("yesterday", "last Monday"). If none, default to today_date; do not ask about period for ordinary single messages. Only ask for period on a clearly ambiguous backlog dump.
 5. BUSINESS — if business_name is null, always ask "Which business is this for?". If set, attach it silently.
 6. BATCH (is_batch true) — extract every line item into items[]. Don't ask type/period per item; group by type if types clearly differ, otherwise ask once for the whole batch. Always return the extracted list for user confirmation.
+7. PERIOD (for summary queries and export requests only) — determine which period the user means:
+   - "today" -> {type: "today", startDate: null, endDate: null}
+   - "this week" / "last 7 days" -> {type: "week", startDate: null, endDate: null}
+   - "this month" -> {type: "month", startDate: null, endDate: null}
+   - "this quarter" / "Q1" / "Q2" etc -> {type: "quarter", startDate: null, endDate: null}
+   - "this year" / "year to date" -> {type: "year", startDate: null, endDate: null}
+   - An explicit date range ("from Aug 6 to Oct 12", "06/08 - 12/10", "between March and May") -> {type: "custom", startDate: "YYYY-MM-DD", endDate: "YYYY-MM-DD"}. Resolve month names and short dates using today_date's year unless a year is explicitly stated. If the range is ambiguous or a date can't be confidently resolved, set needs_clarification true and ask the user to restate the range clearly (e.g. "Could you give me the dates like '1 August to 30 September'?") rather than guessing.
+   - If a summary query or export request has NO period mentioned at all, do not guess — set needs_clarification true and clarification_question to something like "Which period — today, this week, this month, or a custom range?"
+8. EXPORT FORMAT (export requests only) — detect if the user specified a format: "csv", "excel"/"spreadsheet"/"xlsx", or "pdf". If the export request doesn't mention a format, set exportFormat to "unspecified" (not null) — the calling code will prompt for format separately using buttons, so don't ask about format yourself in clarification_question.
 
 Respond ONLY with valid JSON matching this shape, no preamble, no markdown fences:
 {
@@ -302,8 +339,13 @@ Respond ONLY with valid JSON matching this shape, no preamble, no markdown fence
   "clarification_question": string | null,
   "is_batch": boolean,
   "isSummaryQuery": boolean,
-  "queryPeriod": "today" | "week" | "month" | null,
+  "period": {
+    "type": "today" | "week" | "month" | "quarter" | "year" | "custom",
+    "startDate": string | null,
+    "endDate": string | null
+  } | null,
   "isExportRequest": boolean,
+  "exportFormat": "csv" | "excel" | "pdf" | "unspecified" | null,
   "isCorrection": boolean,
   "correctedCategory": string | null,
   "items": [
@@ -325,27 +367,87 @@ Never invent a business name, category, or amount. When unsure, ask one short, s
 function heuristicFallback(text: string, today: string, ctx: UserContext): ParsedMessage {
   const lower = text.toLowerCase().trim();
 
-  // Summary queries
-  if (
+  // Summary queries & Export requests keyword checks
+  const isSummary = (
     lower.includes('how much') || lower.includes('summary') ||
-    lower.includes('spent this month') || lower.includes('expenses this month') ||
-    lower.includes('made this week') || lower.includes('made today') ||
-    lower.includes('income today') || lower.includes('profit this')
-  ) {
-    let queryPeriod: 'today' | 'week' | 'month' = 'month';
-    if (lower.includes('week')) queryPeriod = 'week';
-    else if (lower.includes('today')) queryPeriod = 'today';
-    return ParsedMessageSchema.parse({
-      needs_clarification: false, clarification_question: null, is_batch: false,
-      isSummaryQuery: true, queryPeriod, isExportRequest: false, isCorrection: false, items: [],
-    });
-  }
+    lower.includes('spent this') || lower.includes('expenses this') || lower.includes('expenses for') ||
+    lower.includes('made this') || lower.includes('made today') ||
+    lower.includes('income today') || lower.includes('profit this') ||
+    lower.includes('financial overview') || lower.includes('what are my expenses')
+  );
 
-  // Export requests
-  if (['export', 'csv', 'cvs', 'report', 'excel', 'download', 'spreadsheet', 'pdf', 'image'].some(k => lower.includes(k))) {
+  const isExport = ['export', 'csv', 'cvs', 'report', 'excel', 'download', 'spreadsheet', 'pdf', 'image'].some(k => lower.includes(k));
+
+  if (isSummary || isExport) {
+    let exportFormat: 'csv' | 'excel' | 'pdf' | 'unspecified' | null = null;
+    if (isExport) {
+      if (lower.includes('excel') || lower.includes('spreadsheet') || lower.includes('xlsx')) {
+        exportFormat = 'excel';
+      } else if (lower.includes('pdf')) {
+        exportFormat = 'pdf';
+      } else if (lower.includes('csv') || lower.includes('cvs')) {
+        exportFormat = 'csv';
+      } else {
+        exportFormat = 'unspecified';
+      }
+    }
+
+    let periodType: 'today' | 'week' | 'month' | 'quarter' | 'year' | null = null;
+    if (lower.includes('today')) {
+      periodType = 'today';
+    } else if (lower.includes('week') || lower.includes('7 days')) {
+      periodType = 'week';
+    } else if (lower.includes('quarter') || lower.includes('q1') || lower.includes('q2') || lower.includes('q3') || lower.includes('q4')) {
+      periodType = 'quarter';
+    } else if (lower.includes('year') || lower.includes('yearly') || lower.includes('ytd') || lower.includes('annual')) {
+      periodType = 'year';
+    } else if (lower.includes('month') || lower.includes('monthly')) {
+      periodType = 'month';
+    }
+
+    const looksLikeCustomRange = (
+      /\b(from|between|to|-)\b/i.test(lower) &&
+      /(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec|\d{1,2}[\/\-]\d{1,2})/i.test(lower)
+    );
+
+    if (looksLikeCustomRange) {
+      return ParsedMessageSchema.parse({
+        needs_clarification: true,
+        clarification_question: "I could not resolve that date range right now. Could you try restating it, or select a standard period like today, this week, or this month?",
+        is_batch: false,
+        isSummaryQuery: isSummary,
+        period: null,
+        isExportRequest: isExport,
+        exportFormat,
+        isCorrection: false,
+        items: [],
+      });
+    }
+
+    if (!periodType) {
+      return ParsedMessageSchema.parse({
+        needs_clarification: true,
+        clarification_question: "Which period would you like — today, this week, this month, or a custom range?",
+        is_batch: false,
+        isSummaryQuery: isSummary,
+        period: null,
+        isExportRequest: isExport,
+        exportFormat,
+        isCorrection: false,
+        items: [],
+      });
+    }
+
     return ParsedMessageSchema.parse({
-      needs_clarification: false, clarification_question: null, is_batch: false,
-      isSummaryQuery: false, isExportRequest: true, isCorrection: false, items: [],
+      needs_clarification: false,
+      clarification_question: null,
+      is_batch: false,
+      isSummaryQuery: isSummary,
+      period: { type: periodType, startDate: null, endDate: null },
+      isExportRequest: isExport,
+      exportFormat,
+      isCorrection: false,
+      items: [],
     });
   }
 
@@ -359,7 +461,7 @@ function heuristicFallback(text: string, today: string, ctx: UserContext): Parse
     const match = categoryMap.find(([kw]) => lower.includes(kw));
     return ParsedMessageSchema.parse({
       needs_clarification: false, clarification_question: null, is_batch: false,
-      isSummaryQuery: false, isExportRequest: false, isCorrection: true,
+      isSummaryQuery: false, period: null, isExportRequest: false, exportFormat: null, isCorrection: true,
       correctedCategory: match ? match[1] : 'Other', items: [],
     });
   }
@@ -383,7 +485,7 @@ function heuristicFallback(text: string, today: string, ctx: UserContext): Parse
     return ParsedMessageSchema.parse({
       needs_clarification: true,
       clarification_question: 'Is this money coming in or going out?',
-      is_batch: false, isSummaryQuery: false, isExportRequest: false, isCorrection: false,
+      is_batch: false, isSummaryQuery: false, period: null, isExportRequest: false, exportFormat: null, isCorrection: false,
       items: [{ type: null, amount, currency: 'NGN', category: null, description: text, date: today, business_name: ctx.businessName }],
     });
   }
@@ -392,7 +494,7 @@ function heuristicFallback(text: string, today: string, ctx: UserContext): Parse
     return ParsedMessageSchema.parse({
       needs_clarification: true,
       clarification_question: !type ? 'Is this money coming in or going out?' : 'How much was this for?',
-      is_batch: false, isSummaryQuery: false, isExportRequest: false, isCorrection: false,
+      is_batch: false, isSummaryQuery: false, period: null, isExportRequest: false, exportFormat: null, isCorrection: false,
       items: [{ type, amount, currency: 'NGN', category: null, description: text, date: today, business_name: ctx.businessName }],
     });
   }
@@ -410,7 +512,7 @@ function heuristicFallback(text: string, today: string, ctx: UserContext): Parse
 
   return ParsedMessageSchema.parse({
     needs_clarification: false, clarification_question: null, is_batch: false,
-    isSummaryQuery: false, isExportRequest: false, isCorrection: false,
+    isSummaryQuery: false, period: null, isExportRequest: false, exportFormat: null, isCorrection: false,
     items: [{
       type, amount, currency: 'NGN',
       category: categoryMatch ? categoryMatch[1] : 'Other',

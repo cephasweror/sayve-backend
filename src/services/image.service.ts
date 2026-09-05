@@ -24,7 +24,7 @@ export class ImageService {
     try {
       logger.info(`Analyzing receipt image (${imageBuffer.length} bytes) via Gemini Flash Vision...`);
 
-      const geminiModel = process.env.GEMINI_MODEL || env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+      const geminiModel = process.env.GEMINI_MODEL || env.GEMINI_MODEL || 'gemini-2.0-flash';
       const model = this.geminiClient.getGenerativeModel({ model: geminiModel });
       const prompt = `You are an AI financial receipt reader for Nigerian business owners.
 Look at this image (receipt, invoice, paper ledger, POS slip, or product/item photo).
